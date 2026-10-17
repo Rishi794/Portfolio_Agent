@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -21,7 +22,18 @@ import httpx
 import pandas as pd
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-DEFAULT_UA = "AutonomousPMS/4.0 (quant-research; contact: github.com/autonomous-pms)"
+# SEC requires a declared contact in the User-Agent and answers 403 to generic
+# bot strings (reproduced: same URL, same IP, only the UA differs). Every
+# SEC-backed endpoint shares this constant; ``SEC_USER_AGENT`` overrides it.
+DEFAULT_CONTACT_EMAIL = "rishichowdhury080@gmail.com"
+
+
+def compliant_user_agent() -> str:
+    """A polite, identifiable User-Agent for every government/free data source."""
+    return os.getenv("SEC_USER_AGENT", "").strip() or f"AutonomousPMS/4.0 (contact: {DEFAULT_CONTACT_EMAIL})"
+
+
+DEFAULT_UA = compliant_user_agent()
 
 
 class SourceUnavailable(RuntimeError):
@@ -58,8 +70,13 @@ class HttpClient:
         self.stats = {"requests": 0, "cache_hits": 0, "failures": 0}
 
     # ------------------------------------------------------------------ public --
-    def get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
-        return json.loads(self.get_text(url, params=params))
+    def get_json(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> Any:
+        return json.loads(self.get_text(url, params=params, extra_headers=extra_headers))
 
     def post_json(self, url: str, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> Any:
         key = self._cache_key("POST", url, payload)
@@ -72,14 +89,19 @@ class HttpClient:
         self._write_cache(key, text)
         return json.loads(text)
 
-    def get_text(self, url: str, params: dict[str, Any] | None = None) -> str:
+    def get_text(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> str:
         key = self._cache_key("GET", url, params)
         cached = self._read_cache(key)
         if cached is not None:
             return cached
         if self.offline:
             raise SourceUnavailable(f"offline and no cache for GET {url}")
-        text = self._request("GET", url, params=params)
+        text = self._request("GET", url, params=params, extra_headers=extra_headers)
         self._write_cache(key, text)
         return text
 
@@ -122,7 +144,7 @@ class HttpClient:
             if method == "POST":
                 resp = self._client.post(url, json=json_body, headers=extra_headers)
             else:
-                resp = self._client.get(url, params=params)
+                resp = self._client.get(url, params=params, headers=extra_headers)
             resp.raise_for_status()
             return resp.text
 

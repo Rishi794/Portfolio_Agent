@@ -59,11 +59,13 @@ jobs:
       run_pipeline: ${{ steps.gate.outputs.run }}
       run_label: ${{ steps.decide.outputs.run_label }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
-          enable-cache: true
+          # The gate only needs a throwaway env (`uv run --no-project`); skip the
+          # shared uv cache here so a flaky cache service cannot fail this job.
+          enable-cache: false
 
       - name: Exchange-calendar gate (holidays + US DST slot)
         id: gate
@@ -100,9 +102,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -111,7 +113,7 @@ jobs:
         run: uv sync --all-extras
 
       - name: Restore HTTP cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/pms_http
@@ -122,7 +124,11 @@ jobs:
 
       - name: Ingest company shard
         env:
-          SEC_USER_AGENT: "AutonomousPMS/4.0 (github actions; contact: repo owner)"
+          # SEC answers 403 to generic User-Agents; a real contact address is
+          # required. Update this if you fork the repo (or set a SEC_USER_AGENT
+          # repository variable and reference it here).
+          SEC_USER_AGENT: "AutonomousPMS/4.0 (contact: rishichowdhury080@gmail.com)"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           uv run python -m src.ingestion.company_shard_worker \
             --market ${{ matrix.market }} \
@@ -131,7 +137,7 @@ jobs:
             --output-dir shards \
             --lookback-days 420
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shards-${{ matrix.market }}-${{ matrix.shard }}
           path: shards/
@@ -145,9 +151,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -156,7 +162,7 @@ jobs:
         run: uv sync --all-extras
 
       - name: Cache embedding model + HTTP responses
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/onnx_models
@@ -171,6 +177,8 @@ jobs:
           uv run python -m src.ingestion.macro_fred_pit --output-dir shards || true
 
       - name: Event domains → ONNX embeddings → BH-FDR gate
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           for domain in policy_us_fedreg policy_in_pib_rbi_sebi geopol_gdelt; do
             uv run python -m src.filtering.embedding_projector \
@@ -184,7 +192,7 @@ jobs:
           uv run python -m src.ingestion.tech_patents_openalex \
             --output-dir shards --limit 400 || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shards-domain
           path: shards/
@@ -202,25 +210,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: repo
 
       - name: Checkout portfolio state ('data-state' orphan branch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: data-state
           path: state_branch
           fetch-depth: 0
 
       - name: Restore the lakehouse release cache (previous data_lake)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: data_lake
           key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: pms-lake-${{ github.ref_name }}-
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: repo/uv.lock
@@ -230,13 +238,15 @@ jobs:
         run: uv sync --all-extras
 
       - name: Download every shard
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: shards-*
           path: staged_shards
           merge-multiple: true
 
       - name: DuckDB Fan-In reducer (regime → Löwdin → IC-IR → HRP → tickets)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         working-directory: repo
         run: |
           uv run python -m src.main_v4 \
@@ -295,7 +305,7 @@ jobs:
                  --notes "Rotating Point-in-Time Parquet lakehouse (data_lake/*.parquet)"
           gh release upload v-data-latest lake.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: pages_dist
 
@@ -308,4 +318,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

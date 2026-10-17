@@ -36,11 +36,6 @@ from .market_data import MarketDataIngestor, trailing_trading_days
 from .nse_bse_bhavcopy_corporate_actions import IndianBhavcopyAndCorporateActionIngestor, adjust_for_actions
 from .universe import UniverseLoader, shard_of
 
-US_HEADERS = {
-    "User-Agent": "AutonomousPMS/4.0 (quant-research; contact: github.com/autonomous-pms)",
-    "Accept": "application/json",
-}
-
 
 class UnifiedCompanyShardWorker:
     def __init__(

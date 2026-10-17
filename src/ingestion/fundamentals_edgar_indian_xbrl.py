@@ -30,11 +30,11 @@ import pandas as pd
 from ..config import Config
 from ..filtering.forensics import compute_forensic_metrics, detail_to_json
 from ..filtering.self_calibrating_engine import SelfCalibratingQuantEngine
-from .base import HttpClient, SourceUnavailable, write_shard
+from .base import HttpClient, SourceUnavailable, compliant_user_agent, write_shard
 from .universe import UniverseLoader, shard_of
 
 SEC_HEADERS = {
-    "User-Agent": "AutonomousPMSQuantEngine/4.0 (quant-research; contact: github.com/autonomous-pms)",
+    "User-Agent": compliant_user_agent(),
     "Accept-Encoding": "gzip, deflate",
     "Accept": "application/json",
 }

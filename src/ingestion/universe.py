@@ -1,15 +1,22 @@
 """Universe discovery — no hardcoded ticker lists anywhere in the codebase.
 
-US   : SEC ``company_tickers.json`` (official, free, no key) filtered to the
-       exchanges configured in ``config/universe.yaml``.
-India: NSE index constituent CSV (Nifty 500) served from ``nsearchives``.
+US   : SEC ``company_tickers.json`` (official, free, no key). SEC blocks generic
+       User-Agents (403) and requires a declared contact, sent via
+       ``SEC_USER_AGENT``; datacenter IPs are also sometimes blocked outright, so
+       the official NASDAQ Trader symbol directory is the configured fallback.
+India: NSE index constituent CSV (Nifty 500) served from ``nsearchives``, with
+       the legacy ``archives`` host as fallback.
 
-A ``static_csv`` loader is available for custom universes (``--universe-csv``).
+Every source is declared in ``config/universe.yaml`` as a primary spec plus a
+``fallback`` chain, so a blocked endpoint degrades to the next one instead of
+failing the run. A ``static_csv`` loader serves custom universes
+(``--universe-csv``).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +24,10 @@ import pandas as pd
 
 from ..config import Config
 from .base import HttpClient, SourceUnavailable
+
+# CSV / pipe-delimited endpoints (NASDAQ symbol directory, NSE archives) answer
+# 406 Not Acceptable to a JSON-only ``Accept`` header, so text fetches override it.
+TEXT_ACCEPT = {"Accept": "text/csv, text/plain, */*"}
 
 
 class UniverseLoader:
@@ -27,29 +38,65 @@ class UniverseLoader:
     # -------------------------------------------------------------------- US ----
     def load_us(self, limit: int | None = None) -> pd.DataFrame:
         spec = self.config.market("US")["universe_source"]
-        payload = self.client.get_json(spec["url"])
-        rows = []
+        frame = self._load_with_fallback("US", spec)
         priority = [str(x).lower() for x in spec.get("priority_exchanges", [])]
-        for entry in (payload.values() if isinstance(payload, dict) else payload):
-            ticker = str(entry.get("ticker", "")).upper()
-            if not ticker or any(ch in ticker for ch in "^$."):
-                continue
-            rows.append({"ticker": ticker, "cik": int(entry["cik_str"]), "name": entry.get("title", "")})
-        frame = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
         frame = frame.sort_values("ticker").reset_index(drop=True)
         frame["market"] = "US"
         frame["exchange_priority"] = frame["ticker"].map(lambda _: len(priority))
         cap = limit if limit is not None else int(self.config.market("US").get("max_symbols", 500))
         return frame.head(cap)
 
+    def _load_us_sec_company_tickers(self, spec: dict[str, Any]) -> pd.DataFrame:
+        payload = self.client.get_json(spec["url"])
+        rows = []
+        for entry in (payload.values() if isinstance(payload, dict) else payload):
+            ticker = str(entry.get("ticker", "")).upper()
+            if not ticker or any(ch in ticker for ch in "^$."):
+                continue
+            rows.append({"ticker": ticker, "cik": int(entry["cik_str"]), "name": entry.get("title", "")})
+        return pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
+
+    def _load_us_nasdaq_symdir(self, spec: dict[str, Any]) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for url in spec["urls"]:
+            frame = pd.read_csv(
+                StringIO(self.client.get_text(url, extra_headers=TEXT_ACCEPT)), sep="|", dtype=str
+            )
+            symbol_col = "Symbol" if "Symbol" in frame.columns else "ACT Symbol"
+            if symbol_col not in frame.columns or "Security Name" not in frame.columns:
+                raise SourceUnavailable(f"unrecognized NASDAQ symbol directory payload at {url}")
+            frame = frame.rename(columns={symbol_col: "ticker", "Security Name": "name"})
+            frame = frame[frame["ticker"].notna()].copy()
+            frame["ticker"] = frame["ticker"].str.strip().str.upper()
+            frame = frame[frame["ticker"].str.fullmatch(r"[A-Z][A-Z0-9.\-]*", na=False)]
+            if "Test Issue" in frame.columns:
+                frame = frame[frame["Test Issue"].fillna("").str.strip().str.upper() == "N"]
+            frames.append(frame[["ticker", "name"]])
+        if not frames:
+            raise SourceUnavailable("NASDAQ symbol directory returned no parsable frames")
+        frame = pd.concat(frames, ignore_index=True)
+        # Warrants / units / preferreds / rights / notes are not ordinary equities.
+        junk = r"\b(?:Preferred|Warrants?|Rights?|Units?|Depositary|Notes?)\b"
+        frame = frame[~frame["name"].fillna("").str.contains(junk, case=False, regex=True)]
+        # NASDAQ uses dotted class shares (BRK.A); SEC / Yahoo use dashes (BRK-A).
+        frame["ticker"] = frame["ticker"].str.replace(".", "-", regex=False)
+        frame["cik"] = 0
+        return frame.drop_duplicates(subset=["ticker"])
+
     # ----------------------------------------------------------------- INDIA ----
     def load_india(self, limit: int | None = None) -> pd.DataFrame:
         spec = self.config.market("INDIA")["universe_source"]
-        text = self.client.get_text(spec["url"])
-        from io import StringIO
+        frame = self._load_with_fallback("INDIA", spec)
+        cap = limit if limit is not None else int(self.config.market("INDIA").get("max_symbols", 500))
+        return frame.drop_duplicates(subset=["ticker"]).head(cap).reset_index(drop=True)
 
-        frame = pd.read_csv(StringIO(text))
+    def _load_india_nse_index_csv(self, spec: dict[str, Any]) -> pd.DataFrame:
+        frame = pd.read_csv(StringIO(self.client.get_text(spec["url"], extra_headers=TEXT_ACCEPT)))
         symbol_col = spec.get("symbol_column", "Symbol")
+        if symbol_col not in frame.columns:
+            raise SourceUnavailable(
+                f"unexpected NSE payload at {spec['url']} (columns: {[str(c) for c in list(frame.columns)[:6]]})"
+            )
         name_col = spec.get("name_column", "Company Name")
         sector_col = spec.get("sector_column")
         suffix = str(self.config.market("INDIA").get("symbol_suffix", ".NS"))
@@ -62,8 +109,39 @@ class UniverseLoader:
             }
         )
         out["market"] = "INDIA"
-        cap = limit if limit is not None else int(self.config.market("INDIA").get("max_symbols", 500))
-        return out.drop_duplicates(subset=["ticker"]).head(cap).reset_index(drop=True)
+        return out
+
+    # -------------------------------------------------------------- fallbacks ---
+    def _load_with_fallback(self, market: str, spec: dict[str, Any]) -> pd.DataFrame:
+        """Walk the configured source chain; the first non-empty frame wins."""
+        errors: list[str] = []
+        for candidate in self._source_chain(spec):
+            source_type = str(candidate.get("type", ""))
+            try:
+                frame = self._load_single(market, source_type, candidate)
+            except (SourceUnavailable, KeyError, ValueError, pd.errors.ParserError) as exc:
+                errors.append(f"{source_type or '?'}: {exc}")
+                continue
+            if frame is not None and not frame.empty:
+                return frame
+            errors.append(f"{source_type or '?'}: empty frame")
+        raise SourceUnavailable(f"{market} universe unavailable from every configured source ({'; '.join(errors)})")
+
+    @staticmethod
+    def _source_chain(spec: dict[str, Any]) -> list[dict[str, Any]]:
+        chain = [spec]
+        fallback = spec.get("fallback") or []
+        chain.extend([fallback] if isinstance(fallback, dict) else list(fallback))
+        return chain
+
+    def _load_single(self, market: str, source_type: str, spec: dict[str, Any]) -> pd.DataFrame:
+        if market == "US" and source_type == "sec_company_tickers":
+            return self._load_us_sec_company_tickers(spec)
+        if market == "US" and source_type == "nasdaq_symdir":
+            return self._load_us_nasdaq_symdir(spec)
+        if market == "INDIA" and source_type == "nse_index_csv":
+            return self._load_india_nse_index_csv(spec)
+        raise ValueError(f"unknown universe source type {source_type!r} for market {market}")
 
     # ------------------------------------------------------------------ misc ----
     @staticmethod

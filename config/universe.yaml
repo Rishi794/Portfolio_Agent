@@ -17,6 +17,15 @@ markets:
       type: sec_company_tickers          # https://www.sec.gov/files/company_tickers.json
       url: https://www.sec.gov/files/company_tickers.json
       priority_exchanges: [NYSE, Nasdaq, NYSE American, NYSE Arca, Cboe]
+      # sec.gov answers 403 to generic User-Agents (the declared contact lives in
+      # SEC_USER_AGENT / src/ingestion/base.py) and sometimes to datacenter IPs
+      # outright. The official NASDAQ Trader symbol directory is the fallback:
+      # still free, key-less, and reachable from GitHub runners.
+      fallback:
+        - type: nasdaq_symdir
+          urls:
+            - https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt
+            - https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt
   INDIA:
     calendar: XBOM
     timezone: Asia/Kolkata
@@ -32,6 +41,12 @@ markets:
       symbol_column: Symbol
       sector_column: "Industry"
       name_column: "Company Name"
+      fallback:
+        - type: nse_index_csv
+          url: https://archives.nseindia.com/content/indices/ind_nifty500list.csv
+          symbol_column: Symbol
+          sector_column: "Industry"
+          name_column: "Company Name"
 
 # --------------------------------------------------------------------------
 # Cross-asset / external market factor registry (Yahoo Finance chart API, free,

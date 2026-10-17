@@ -40,16 +40,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       - run: uv sync --all-extras
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cache/pms_sec
@@ -60,6 +60,9 @@ jobs:
           restore-keys: pms-deep-${{ matrix.market }}-
 
       - name: Deep fundamentals + long OHLCV history shard
+        env:
+          SEC_USER_AGENT: "AutonomousPMS/4.0 (contact: rishichowdhury080@gmail.com)"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           uv run python -m src.ingestion.company_shard_worker \
             --market ${{ matrix.market }} \
@@ -69,7 +72,7 @@ jobs:
             --lookback-days 1500 \
             --backend onnx
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deep-${{ matrix.market }}-${{ matrix.shard }}
           path: shards/
@@ -80,16 +83,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       - run: uv sync --all-extras
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cache/pms_openalex
@@ -107,7 +110,7 @@ jobs:
               --shard-id "$shard" --total-shards 5 || true
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deep-tech
           path: shards/
@@ -120,23 +123,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: repo
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: data-state
           path: state_branch
           fetch-depth: 0
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: data_lake
           key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: pms-lake-${{ github.ref_name }}-
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: repo/uv.lock
@@ -145,13 +148,15 @@ jobs:
         working-directory: repo
         run: uv sync --all-extras
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: deep-*
           path: staged_shards
           merge-multiple: true
 
       - name: Fan-In (weekly deep sync)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         working-directory: repo
         run: |
           uv run python -m src.main_v4 \
@@ -226,9 +231,9 @@ jobs:
                  --notes "Rotating Point-in-Time Parquet lakehouse (data_lake/*.parquet)"
           gh release upload v-data-latest lake.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: pages_dist
 
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

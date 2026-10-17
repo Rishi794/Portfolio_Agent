@@ -34,23 +34,23 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout code (main)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout portfolio state ('data-state')
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: data-state
           path: state_branch
           fetch-depth: 0
 
       - name: Restore the lakehouse (for corporate-action reconciliation)
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: data_lake
           key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: pms-lake-${{ github.ref_name }}-
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -98,9 +98,9 @@ jobs:
           gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --body-file fill_receipt.md
           gh issue close "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --reason completed
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: pages_dist
 
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
