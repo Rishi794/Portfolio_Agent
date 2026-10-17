@@ -120,6 +120,21 @@ bash scripts/bootstrap_state_branch.sh
 gh workflow run parallel_dag_pipeline.yml -f target_market=BOTH
 ```
 
+**One-time GitHub settings** (Settings → …):
+
+* **Pages → Build and deployment → Source: GitHub Actions** — the fan-in stage
+  publishes the dashboard artifact as the Pages site.
+* **Actions → General → Workflow permissions: Read and write** — the fan-in stage
+  commits the ledger snapshot back to the `data-state` branch and refreshes the
+  rolling `v-data-latest` release.
+* Optional: add repository secrets `FRED_API_KEY` and `PATENTSVIEW_API_KEY`
+  (Actions → Secrets and variables). Both feeds degrade gracefully without them.
+
+The scheduled crons only arm **after this repository has a run of activity on the
+default branch**; the `cron_heartbeat` workflow keeps them alive month after month,
+and every schedule tick is gated by the exchange calendar (holidays exit in Stage 1
+without starting any worker).
+
 Then:
 
 * the pipeline opens **“📈 V4 Rebalance Recommendation — YYYY-MM-DD”** with the full
