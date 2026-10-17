@@ -197,6 +197,14 @@ def adjust_for_actions(prices: pd.DataFrame, actions: pd.DataFrame) -> pd.DataFr
     out = prices.copy()
     out["date"] = pd.to_datetime(out["date"])
     out["adj_close"] = pd.to_numeric(out.get("adj_close", out["close"]), errors="coerce").fillna(out["close"])
+    # Newer pandas raise instead of silently upcasting when a fractional value lands in
+    # an int64 column. Bhavcopy volume arrives as int64 (whole-number prices can too),
+    # and every split/dividend adjustment below can produce fractional values, so the
+    # touched columns are promoted to float64 up-front (the lakehouse schema wants
+    # DOUBLE for all of them anyway).
+    for column in ("open", "high", "low", "close", "adj_close", "volume"):
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce").astype("float64")
     if actions is None or actions.empty:
         out["dollar_volume"] = out["close"] * pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
         return out
