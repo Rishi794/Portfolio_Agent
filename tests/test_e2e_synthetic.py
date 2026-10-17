@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -29,7 +30,19 @@ def test_e2e_summary_structure(e2e: dict) -> None:
         assert diagnostics["orthogonality_error"] < 1e-3
         assert diagnostics["cash_buffer"] >= 0.03
         assert 0.0 <= diagnostics["invested_weight"] <= 0.97
-        assert len(diagnostics["pillar_weights"]) == 6
+        assert len(diagnostics["pillar_weights"]) == len(diagnostics["pillar_names"])
+        assert diagnostics["pillar_names"][:6] == [
+            "kalman_trend",
+            "fundamentals",
+            "tech_evolution",
+            "gov_policy",
+            "geopolitics",
+            "macro_beta",
+        ]
+        # Stage-3 7th pillar: Timestral is present even offline (empirical fallback),
+        # and never loads the 837 MB checkpoint inside the synthetic test suite.
+        assert diagnostics["pillar_names"][-1] == "timestral"
+        assert diagnostics["timestral"]["mode"] in {"offline_fallback", "disabled"}
         assert abs(sum(diagnostics["pillar_weights"]) - 1.0) < 1e-6
         assert diagnostics["eligible"] > 0
 
@@ -46,6 +59,10 @@ def test_e2e_writes_the_lakehouse_tables(e2e: dict) -> None:
     calibration = lake.read("calibration_state")
     for scope in ("US:forensic_gate", "INDIA:forensic_gate", "US:factor_weight", "INDIA:factor_weight"):
         assert (calibration["scope"] == scope).any()
+    scores = lake.read("factor_scores")
+    assert "timestral" in scores.columns, "the 7th pillar must be persisted for next-run IC-IR learning"
+    assert pd.to_numeric(scores["timestral"], errors="coerce").notna().any()
+    assert np.isfinite(scores["composite_alpha"].to_numpy(dtype=float)).all()
 
 
 def test_e2e_state_branch_artifacts(e2e: dict) -> None:
@@ -127,6 +144,11 @@ def test_v5_open_aladdin_layer_and_dashboard(e2e: dict, config, tmp_path: Path) 
         info = telemetry["markets"][market]
         assert info["port_ann_vol_pct"] >= 0.0
         assert info["daily_student_t_cvar99_pct"] >= 0.0
+        # V5 forward-CVaR fusion: the reported tail is the conservative max of the
+        # historical Student-t ES and the weight-weighted Timestral forward loss.
+        assert info["daily_fused_cvar99_pct"] >= info["daily_student_t_cvar99_pct"] - 1e-12
+        assert info["cvar_binding_source"] in {"student_t", "timestral"}
+        assert isinstance(info["daily_timestral_cvar99_pct"], float)
         assert info["ibor_identity_ok"], info["ibor_discrepancy"]
         assert len(info["ledger_state_sha256"]) == 64
     # Pending-order contract survives the compliance pass (no golden shards in synthetic).

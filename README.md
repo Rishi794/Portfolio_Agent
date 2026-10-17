@@ -32,6 +32,7 @@ Plotly dashboard to GitHub Pages.
 | **④ Government policies** | Federal Register (US), PIB/RBI/SEBI (India) – rule stage, authority weight | Federal Register API, PIB/RBI/SEBI |
 | **⑤ Technology evolution** | Citation/publication velocity, productive R&D, capex-to-depreciation modernisation | OpenAlex (keyless), optional PatentsView |
 | **⑥ Company fundamentals** | Beneish M-Score, Piotroski F-Score, ROIC–WACC spread, FCF/EV, 10-K business-text embeddings | SEC EDGAR XBRL, NSE/BSE Ind-AS results & Reg-31 pledges |
+| **⑦ Zero-shot structural forecast** (Stage 3) | `mistralai/Timestral-209M` patch-transformer: 21 non-crossing quantiles, joint variate attention over the cross-section + macro drivers | Hugging Face Hub checkpoint, mounted only in the fan-in job |
 
 The three hard problems the architecture solves explicitly:
 
@@ -47,10 +48,37 @@ The three hard problems the architecture solves explicitly:
    acceptance threshold `τ̂` is derived from the **exact** spherical-null distribution
    of cosine similarity (`t = z·√((D−1)/(1−z²)) ~ Student-t(D−1)`) plus a
    Benjamini–Hochberg FDR step-up at `α = 1/√M`. No hardcoded 0.62.
-3. **Multicollinearity** — the six pillars are correlated by construction. Before the
+3. **Multicollinearity** — the pillars (six V4 factor domains plus the Stage-3 Timestral
+   forecaster when enabled) are correlated by construction. Before the
    optimizer they are fused with **symmetric (Löwdin) orthogonalization**
    `F⊥ = F·C_F^(−1/2)`, which decorrelates while minimizing `‖F⊥ − F‖_F` (keeps the
    economic interpretation of each pillar, unlike PCA rotation).
+
+### The Stage-3 Timestral pillar (7th domain)
+
+`src/filtering/timestral_forecaster.py` wraps Mistral's **Timestral** forecasting
+foundation models (code Apache-2.0, weights Modified-MIT) as the pipeline's seventh
+pillar:
+
+* **Multivariate, not per-stock.** The surviving cross-section is stacked with the
+  macro/spillover variates into one `(B=1, V, T)` context (liquidity-capped at 128
+  names) so the 24 variate-attention layers price cross-stock and macro→stock
+  lead-lag structure in a single forward pass — looping `V = 1` per name would
+  disable that attention stack and cost ~140 s instead of ~4 s.
+* **Stationary targets only.** Raw prices are never fed to the model: the target
+  variate is the volatility-standardised log return, the past covariate is
+  `log(volume / ADV₂₀)`, and known-future rows are exchange-rule calendar events
+  (NSE last-Thursday expiry, US third-Friday, month-end) plus *announced*
+  corporate-action ex-dates.
+* **Quantile algebra.** `E[R] = ∫₀¹ F⁻¹(p) dp` is evaluated by trapezoidal
+  quadrature over the 21 levels; upside/downside semi-dispersions give the
+  tail-penalised `f_timestral`, and `q(0.01)` feeds a forward CVaR that the V5 gate
+  fuses with the historical Student-t ES as `max(ES₉₉, Σ wᵢ·CVaRᵢ)`.
+* **Cost control.** The 837 MB checkpoint extra (`uv sync --extra timestral`) is
+  installed and cached **only in the fan-in job**; the ten Stage-2A shards never
+  see torch. When the package or checkpoint is unavailable the engine degrades to a
+  deterministic empirical-quantile fallback and reports `mode = offline_fallback`
+  in the run diagnostics, so the pipeline never fails on a cold cache.
 
 ---
 

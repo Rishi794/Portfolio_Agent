@@ -262,8 +262,10 @@ function renderBook(prefix, book) {
     fmt(curr, book.cash) + ' (' + Number(book.cash_pct).toFixed(1) + '%)';
   document.getElementById(prefix + '-vol').textContent =
     (risk.port_ann_vol_pct !== undefined ? Number(risk.port_ann_vol_pct).toFixed(2) : '—') + '%';
+  const cvar = risk.daily_fused_cvar99_pct !== undefined
+    ? risk.daily_fused_cvar99_pct : risk.daily_student_t_cvar99_pct;
   document.getElementById(prefix + '-cvar').textContent =
-    risk.daily_student_t_cvar99_pct !== undefined ? '-' + Number(risk.daily_student_t_cvar99_pct).toFixed(2) + '%' : '—';
+    cvar !== undefined ? '-' + Number(cvar).toFixed(2) + '%' : '—';
   document.getElementById(prefix + '-merkle').textContent =
     risk.ledger_state_sha256 ? 'LEDGER: ' + risk.ledger_state_sha256.slice(0, 12) : 'LEDGER: genesis';
 

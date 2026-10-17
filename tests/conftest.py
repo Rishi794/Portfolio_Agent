@@ -3,6 +3,7 @@ end-to-end pipeline run (the whole CI suite makes zero network calls)."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,17 @@ from src.synthetic import generate_synthetic_lakehouse
 
 SYNTHETIC_DAYS = 260
 SYNTHETIC_TICKERS = 48
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _hermetic_forecaster() -> None:
+    """Force the Timestral Stage-3 engine into its offline fallback for the whole run.
+
+    The CI suite makes zero network calls; without this, any job that happens to have
+    the ``timestral`` extra installed (and the fan-in's 837 MB HF cache) would pull the
+    checkpoint into unit tests.
+    """
+    os.environ["PMS_TIMESTRAL_DISABLED"] = "1"
 
 
 @pytest.fixture(scope="session")

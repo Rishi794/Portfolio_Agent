@@ -42,6 +42,7 @@ from .filtering.lowdin_orthogonalizer import (
 from .filtering.regime_turbulence import MacroRegimeDetector, RegimeAllocation
 from .filtering.self_calibrating_engine import SelfCalibratingQuantEngine
 from .filtering.statistics import sector_zscore, winsorize, zscore
+from .filtering.timestral_forecaster import TIMESTRAL_PILLAR, TimestralForecastEngine
 from .portfolio.hrp_optimizer import HRPOptimizer
 from .state.ledger import Ledger
 from .storage.lakehouse import Lakehouse, manifest_row
@@ -105,6 +106,10 @@ class V4AutonomousPortfolioReducer:
         self.engine = SelfCalibratingQuantEngine(config)
         self.regime_detector = MacroRegimeDetector(config)
         self.optimizer = HRPOptimizer(config)
+        self.timestral_enabled = bool(config.get("aladdin.timestral.enabled", True))
+        self.timestral_engine = TimestralForecastEngine(config) if self.timestral_enabled else None
+        # ``market -> ticker-indexed Timestral frame`` for the V5 forward-CVaR fusion.
+        self.timestral_frames: dict[str, pd.DataFrame] = {}
         self.run_id = f"{uuid.uuid4().hex[:8]}-{self.as_of:%Y%m%d}"
         self.calibration_rows: list[dict[str, Any]] = []
 
@@ -423,6 +428,110 @@ class V4AutonomousPortfolioReducer:
             )
         return score, mask
 
+    # ------------------------------------------------------ timestral pillar --
+    def pillar_names(self) -> tuple[str, ...]:
+        """Canonical pillar order; the Stage-3 Timestral pillar is appended when enabled."""
+        return (*PILLARS, TIMESTRAL_PILLAR) if self.timestral_enabled else PILLARS
+
+    def _pillar_prior(self, regime: RegimeAllocation, active: Sequence[str]) -> np.ndarray:
+        """Regime prior renormalized over the *active* pillars (incl. Timestral)."""
+        table = dict(zip(PILLARS, np.asarray(regime.domain_weights, dtype=float)))
+        table[TIMESTRAL_PILLAR] = float(self.config.get("aladdin.timestral.prior_weight", 0.05))
+        vector = np.asarray([table.get(name, 0.0) for name in active], dtype=float)
+        total = float(vector.sum())
+        return vector / total if total > 0 else np.ones(len(active)) / max(len(active), 1)
+
+    def _known_ex_dates(self, market: str) -> dict[str, set[dt.date]]:
+        """Announced corporate actions whose ex-date falls inside the forecast window.
+
+        PIT discipline: the *announcement* (``knowledge_timestamp``) must predate
+        ``as_of``; the ex-date itself is a scheduled, known-future event.
+        """
+        actions = self.lake.read("corporate_actions")
+        if actions.empty:
+            return {}
+        frame = actions[actions["market"].astype(str) == market].copy()
+        if frame.empty:
+            return {}
+        frame["ex_date"] = pd.to_datetime(frame["ex_date"])
+        frame = frame[
+            pd.to_datetime(frame["knowledge_timestamp"], utc=True) <= pd.Timestamp(self.as_of, tz="UTC")
+        ]
+        horizon = int(self.config.get("aladdin.timestral.ex_date_horizon_days", 30))
+        window = frame[
+            (frame["ex_date"] >= self.as_of) & (frame["ex_date"] <= self.as_of + pd.Timedelta(days=horizon))
+        ]
+        out: dict[str, set[dt.date]] = {}
+        for ticker, group in window.groupby("ticker", sort=False):
+            out[str(ticker)] = {timestamp.date() for timestamp in group["ex_date"]}
+        return out
+
+    def _timestral_factor(
+        self,
+        market: str,
+        universe_index: pd.Index,
+        sectors: pd.Series | None,
+        macro_matrix: pd.DataFrame | None,
+    ) -> pd.Series:
+        """Cross-sectionally z-scored ``f_timestral`` for every candidate with history."""
+        engine = self.timestral_engine
+        if engine is None:
+            return pd.Series(dtype=float)
+        panel, _ = self.query_pit_split_adjusted_universe(market)
+        if panel.empty:
+            return pd.Series(dtype=float)
+        tickers = set(panel["ticker"].astype(str))
+        candidates = [str(ticker) for ticker in universe_index if str(ticker) in tickers]
+        groups = {
+            str(ticker): group
+            for ticker, group in panel[panel["ticker"].astype(str).isin(candidates)].groupby("ticker", sort=False)
+        }
+        frame = engine.forecast_universe_cross_section(
+            groups,
+            market=market,
+            sectors=sectors,
+            ex_dates_by_ticker=self._known_ex_dates(market),
+            macro_frame=macro_matrix,
+        )
+        self.timestral_frames[market] = frame
+        if frame.empty:
+            return pd.Series(dtype=float)
+        return zscore(frame["f_timestral"].reindex(universe_index).fillna(0.0), 0.0)
+
+    def _timestral_risk_inputs(
+        self, market: str, target: pd.Series, current_weights: dict[str, float]
+    ) -> dict[str, Any]:
+        """Weights-weighted forward tail metrics for the V5 forward-CVaR fusion.
+
+        Uses the *post-trade* target book when one exists, otherwise the live book.
+        """
+        if self.timestral_engine is None:
+            return {"timestral_mode": "disabled"}
+        out: dict[str, Any] = {"timestral_mode": self.timestral_engine.mode}
+        frame = self.timestral_frames.get(market)
+        if frame is None or frame.empty:
+            return out
+        weights = target if target is not None and not target.empty else pd.Series(current_weights, dtype=float)
+        if weights.empty:
+            return out
+        weights = pd.to_numeric(weights, errors="coerce").dropna()
+        weights = weights[weights > 0.0]
+        common = weights.index.intersection(frame.index)
+        total = float(weights.reindex(common).sum())
+        if len(common) == 0 or not np.isfinite(total) or total <= 0.0:
+            return {**out, "timestral_covered_names": 0}
+        normalized = weights.reindex(common).to_numpy(dtype=float) / total
+        cvar = float(np.dot(normalized, frame.loc[common, "timestral_cvar99_pct"].to_numpy(dtype=float)))
+        expected = float(
+            np.dot(normalized, frame.loc[common, "timestral_exp_ret_5d_pct"].to_numpy(dtype=float))
+        )
+        return {
+            **out,
+            "timestral_forward_cvar99_pct": round(cvar, 4),
+            "timestral_exp_ret_5d_weighted_pct": round(expected, 4),
+            "timestral_covered_names": int(len(common)),
+        }
+
     def build_factor_matrix(
         self,
         market: str,
@@ -455,17 +564,39 @@ class V4AutonomousPortfolioReducer:
         macro_beta = self.factor_macro_beta(market, returns, macro_matrix)
         macro_beta = zscore(macro_beta.reindex(universe_index).fillna(0.0), 0.0)
 
-        factors = pd.DataFrame(
-            {
-                "kalman_trend": trend,
-                "fundamentals": quality,
-                "tech_evolution": tech_scores,
-                "gov_policy": policy_scores,
-                "geopolitics": geopol_scores,
-                "macro_beta": macro_beta,
-            }
-        )
-        factors = factors[list(PILLARS)]
+        sectors = None
+        if not fundamentals.empty and "gics_sector" in fundamentals.columns:
+            sectors = fundamentals["gics_sector"].reindex(universe_index)
+
+        # Stage-3 7th pillar: Timestral's covariate-conditioned forward quantiles.
+        # A failure here must never take the fan-in down: record the mode and move on.
+        timestral = pd.Series(dtype=float)
+        diagnostics["timestral"] = {"mode": "disabled", "names": 0}
+        if self.timestral_engine is not None:
+            try:
+                timestral = self._timestral_factor(market, universe_index, sectors, macro_matrix)
+            except Exception as error:  # noqa: BLE001 - degrade to the 6-pillar mix
+                diagnostics["timestral"] = {"mode": "error", "error": f"{type(error).__name__}: {error}"}
+            else:
+                diagnostics["timestral"] = {
+                    "mode": self.timestral_engine.mode,
+                    "names": int(len(timestral)),
+                    "load_error": self.timestral_engine.load_error,
+                }
+
+        columns: dict[str, pd.Series] = {
+            "kalman_trend": trend,
+            "fundamentals": quality,
+            "tech_evolution": tech_scores,
+            "gov_policy": policy_scores,
+            "geopolitics": geopol_scores,
+            "macro_beta": macro_beta,
+        }
+        if not timestral.empty:
+            columns[TIMESTRAL_PILLAR] = timestral.reindex(universe_index).fillna(0.0)
+        factors = pd.DataFrame(columns)
+        active = [name for name in self.pillar_names() if name in factors.columns]
+        factors = factors[active]
         metadata = pd.DataFrame(
             {
                 "eligible": gate.reindex(universe_index).fillna(False),
@@ -483,21 +614,23 @@ class V4AutonomousPortfolioReducer:
                 "geopolitics": geopol_diag,
                 "universe": len(universe_index),
                 "eligible": int(metadata["eligible"].sum()),
-                "raw_max_abs_correlation": max_abs_correlation(factors[list(PILLARS)]),
-                "raw_condition_number": condition_number(factors[list(PILLARS)]),
+                "pillar_names": active,
+                "raw_max_abs_correlation": max_abs_correlation(factors[active]),
+                "raw_condition_number": condition_number(factors[active]),
             }
         )
         return factors, diagnostics
 
     # ======================================================================= fuse
     def pillar_weights(self, market: str, regime: RegimeAllocation, factors: pd.DataFrame) -> tuple[np.ndarray, dict[str, Any]]:
+        active = [name for name in self.pillar_names() if name in factors.columns]
         mode = str(self.config.e("factor_learning.mode", "ic_ir"))
-        prior = regime.domain_weights
+        prior = self._pillar_prior(regime, active)
         if mode != "ic_ir":
-            return prior, {"mode": "regime_prior", "observations": 0}
-        history = self._historical_ic_panels(market)
+            return prior, {"mode": "regime_prior", "observations": 0, "pillar_names": active}
+        history = self._historical_ic_panels(market, pillars=active)
         if not history["factors"]:
-            return prior, {"mode": "regime_prior_cold_start", "observations": 0}
+            return prior, {"mode": "regime_prior_cold_start", "observations": 0, "pillar_names": active}
         learned = self.engine.learn_rolling_ic_ir_factor_weights(history["factors"], history["forward_returns"])
         observations = int(learned.get("observations", 0))
         weights = self.engine.blend_with_prior(
@@ -506,15 +639,19 @@ class V4AutonomousPortfolioReducer:
         return weights, {
             "mode": learned.get("mode", mode),
             "observations": observations,
-            "ic_mean": np.round(np.asarray(learned.get("ic_mean", np.zeros(len(PILLARS))), dtype=float), 4).tolist(),
+            "pillar_names": active,
+            "ic_mean": np.round(np.asarray(learned.get("ic_mean", np.zeros(len(active))), dtype=float), 4).tolist(),
             "learned_weights": np.round(np.asarray(learned["weights"], dtype=float), 4).tolist(),
         }
 
-    def _historical_ic_panels(self, market: str, *, max_dates: int = 120) -> dict[str, list[Any]]:
+    def _historical_ic_panels(
+        self, market: str, *, pillars: Sequence[str] | None = None, max_dates: int = 120
+    ) -> dict[str, list[Any]]:
         scores = self.lake.read("factor_scores")
         out: dict[str, list[Any]] = {"factors": [], "forward_returns": []}
         if scores.empty:
             return out
+        canonical = list(pillars or self.pillar_names())
         frame = scores[scores["market"].astype(str) == market].copy()
         if frame.empty:
             return out
@@ -530,7 +667,14 @@ class V4AutonomousPortfolioReducer:
             cross = frame[frame["date"] == date].set_index("ticker")
             if len(cross) < 10:
                 continue
-            raw = cross[list(PILLARS)].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            # Older runs predate the Timestral pillar: reindex to the canonical active
+            # columns and zero-fill so every IC panel has identical width (the learner
+            # treats a missing pillar as "no information", IC = 0).
+            raw = (
+                cross.reindex(columns=canonical)
+                .apply(pd.to_numeric, errors="coerce")
+                .fillna(0.0)
+            )
             ortho = lowdin_orthogonalize(
                 raw,
                 winsor_quantile=float(self.config.e("lowdin.winsor_quantile", 0.02)),
@@ -553,7 +697,8 @@ class V4AutonomousPortfolioReducer:
         season_diagnostics: dict[str, Any] | None = None,
     ) -> tuple[pd.Series, pd.DataFrame, dict[str, Any]]:
         eligible = factors["eligible"].astype(bool) if "eligible" in factors.columns else pd.Series(True, index=factors.index)
-        raw = factors[list(PILLARS)].loc[eligible]
+        active = [name for name in self.pillar_names() if name in factors.columns]
+        raw = factors[active].loc[eligible]
         if raw.empty:
             return pd.Series(dtype=float), pd.DataFrame(), {"reason": "no_eligible_names"}
         ortho = lowdin_orthogonalize(
@@ -572,7 +717,7 @@ class V4AutonomousPortfolioReducer:
             **weight_diagnostics,
             **(season_diagnostics or {}),
         }
-        for pillar, weight in zip(PILLARS, diagnostics["pillar_weights"]):
+        for pillar, weight in zip(diagnostics.get("pillar_names", active), diagnostics["pillar_weights"]):
             self.calibration_rows.append(
                 {
                     "as_of_date": self.as_of,
@@ -685,6 +830,7 @@ class V4AutonomousPortfolioReducer:
             equity,
         )
         diagnostics.update(allocation_diagnostics)
+        diagnostics.update(self._timestral_risk_inputs(market, target, current_weights))
 
         scores_table = self.factor_score_table(market, ortho, alpha, regime)
         if not scores_table.empty:

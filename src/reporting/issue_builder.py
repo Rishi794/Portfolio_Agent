@@ -81,11 +81,15 @@ def _market_block(market: str, run, diagnostics: dict[str, Any], top_n: int) -> 
     ]
     weights = diagnostics.get("pillar_weights")
     if weights:
+        names = diagnostics.get("pillar_names") or list(PILLARS)
         lines.append(
             "**Pillar weights** "
-            + " · ".join(f"`{name}`={weight:.3f}" for name, weight in zip(PILLARS, weights))
+            + " · ".join(f"`{name}`={weight:.3f}" for name, weight in zip(names, weights))
             + f" · weight mode `{diagnostics.get('mode', 'n/a')}` ({diagnostics.get('observations', 0)} IC obs)"
         )
+        timestral_mode = diagnostics.get("timestral_mode")
+        if timestral_mode:
+            lines.append(f"**Timestral 7th pillar** mode `{timestral_mode}`")
         lines.append("")
     lines.append(
         f"**Signal hygiene** raw max |ρ| `{_fmt(diagnostics.get('raw_max_abs_correlation'))}` → "

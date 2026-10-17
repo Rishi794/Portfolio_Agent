@@ -179,6 +179,7 @@ TABLE_SPECS: dict[str, TableSpec] = {
             "gov_policy": "DOUBLE",
             "geopolitics": "DOUBLE",
             "macro_beta": "DOUBLE",
+            "timestral": "DOUBLE",
             "composite_alpha": "DOUBLE",
             "regime": "VARCHAR",
             "turbulence_d2": "DOUBLE",

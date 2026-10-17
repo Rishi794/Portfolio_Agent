@@ -25,9 +25,33 @@ onnx = [
     "tokenizers>=0.20",
     "huggingface-hub>=0.24",
 ]
+# Stage-3 only: Mistral Timestral zero-shot forecaster (the 7th pillar). This extra
+# is installed **only in the fan-in job** — the 209M checkpoint is 837 MB, so it must
+# never ride along with the ten parallel Stage-2A company shards (see
+# .github/workflows/parallel_dag_pipeline.yml). Without it the engine degrades to its
+# deterministic empirical fallback and reports ``mode = offline_fallback``.
+timestral = [
+    "torch>=2.4",
+    "safetensors>=0.4.5",
+    "timestral",
+]
 dev = [
     "pytest>=8.2",
 ]
+
+[tool.uv]
+# The fan-in runs on the free GitHub Ubuntu runners (no GPU). The default PyPI torch
+# wheel bundles the CUDA runtime; pin the CPU-only wheel index instead.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+# Standalone inference package for the Timestral checkpoints (Apache-2.0). Pinned to
+# the default branch; uv.lock records the resolved commit for reproducibility.
+timestral = { git = "https://github.com/mistralai/timestral.git", branch = "main" }
 
 [project.scripts]
 pms = "src.main_v4:main"

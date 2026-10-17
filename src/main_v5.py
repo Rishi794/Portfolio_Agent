@@ -199,6 +199,16 @@ class V5OpenAladdinPipeline:
             json.dumps(snapshot, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
+        # V5 CVaR fusion (policy): the portfolio's 99% tail is the *conservative max*
+        # of the historical Student-t ES and the weight-weighted Timestral forward
+        # 1%-quantile loss. Note the units asymmetry: the Student-t number is an
+        # expected shortfall, the Timestral number a forward quantile, so Timestral
+        # can only bind when its forward tail is genuinely deeper.
+        diagnostics = run.get("diagnostics") or {}
+        timestral_cvar = max(float(diagnostics.get("timestral_forward_cvar99_pct", 0.0) or 0.0), 0.0)
+        fused_cvar = max(float(cvar_pct), timestral_cvar)
+        binding_source = "timestral" if timestral_cvar > float(cvar_pct) + 1e-12 else "student_t"
+
         return {
             "market": market,
             "as_of": summary.get("as_of"),
@@ -207,6 +217,11 @@ class V5OpenAladdinPipeline:
             "eligible_size": run.get("eligible_size"),
             "port_ann_vol_pct": volatility_pct,
             "daily_student_t_cvar99_pct": cvar_pct,
+            "daily_timestral_cvar99_pct": round(timestral_cvar, 4),
+            "daily_fused_cvar99_pct": round(fused_cvar, 4),
+            "cvar_binding_source": binding_source,
+            "timestral_mode": diagnostics.get("timestral_mode"),
+            "timestral_forward_exp_ret_5d_pct": diagnostics.get("timestral_exp_ret_5d_weighted_pct"),
             "cvar_confidence": self.engine.confidence,
             "weight_basis": "invested_sleeve_normalized",
             "euler_risk_table": euler_rows,
@@ -233,7 +248,13 @@ class V5OpenAladdinPipeline:
             telemetry["markets"][market] = info
             run["v5"] = {
                 key: info[key]
-                for key in ("port_ann_vol_pct", "daily_student_t_cvar99_pct", "ibor_identity_ok")
+                for key in (
+                    "port_ann_vol_pct",
+                    "daily_student_t_cvar99_pct",
+                    "daily_fused_cvar99_pct",
+                    "cvar_binding_source",
+                    "ibor_identity_ok",
+                )
             }
         payload = json.dumps(_jsonable(telemetry), sort_keys=True, default=str).encode("utf-8")
         telemetry["merkle_state_hash"] = hashlib.sha256(payload).hexdigest()
@@ -255,6 +276,16 @@ class V5OpenAladdinPipeline:
         return telemetry
 
 
+def _fmt_optional(value: Any) -> str:
+    """Format an optional telemetry number for the Issue markdown."""
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):+.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 def format_aladdin_markdown(summary: dict[str, Any], telemetry: dict[str, Any]) -> str:
     """Markdown block appended to the daily Issue with the V5 telemetry."""
     lines: list[str] = [
@@ -274,7 +305,14 @@ def format_aladdin_markdown(summary: dict[str, Any], telemetry: dict[str, Any]) 
         lines.append(f"### {market}")
         lines.append(
             f"- **Annualized Volatility (σ_p):** `{float(info.get('port_ann_vol_pct', 0.0)):.2f}%` | "
-            f"**Daily Student-t CVaR@99%:** `-{float(info.get('daily_student_t_cvar99_pct', 0.0)):.2f}%`"
+            f"**Daily CVaR@99% (fused):** `-{float(info.get('daily_fused_cvar99_pct', info.get('daily_student_t_cvar99_pct', 0.0))):.2f}%` "
+            f"(Student-t `-{float(info.get('daily_student_t_cvar99_pct', 0.0)):.2f}%` · "
+            f"Timestral forward `-{float(info.get('daily_timestral_cvar99_pct', 0.0)):.2f}%` · "
+            f"binding `{info.get('cvar_binding_source', 'student_t')}`)"
+        )
+        lines.append(
+            f"- **Timestral 7th pillar:** mode `{info.get('timestral_mode') or 'disabled'}` · "
+            f"forward 5-day expected return `{_fmt_optional(info.get('timestral_forward_exp_ret_5d_pct'))}%`"
         )
         lines.append(
             f"- **Golden-copy quarantine:** `{len(quarantined)}`"
@@ -402,7 +440,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  {market}: regime={info.get('regime')} "
                 f"sigma_p={float(info.get('port_ann_vol_pct', 0.0)):.2f}% "
-                f"cvar99=-{float(info.get('daily_student_t_cvar99_pct', 0.0)):.2f}% "
+                f"cvar99=-{float(info.get('daily_fused_cvar99_pct', info.get('daily_student_t_cvar99_pct', 0.0))):.2f}% "
+                f"(binding={info.get('cvar_binding_source', 'student_t')}) "
                 f"quarantined={len(info.get('quarantined_tickers') or [])} "
                 f"blocked={len(info.get('compliance_blocked_orders') or [])} "
                 f"ibor_ok={info.get('ibor_identity_ok')}"
