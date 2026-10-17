@@ -20,6 +20,7 @@ Emits ``markets`` (expanded list, e.g. ``US,INDIA`` / ``US``) and ``run`` to
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -95,13 +96,18 @@ def main() -> int:
     target = (os.getenv("TARGET_MARKET") or "BOTH").upper()
 
     candidates = [market for market in ("INDIA", "US") if target in ("BOTH", market)]
-    if event == "workflow_dispatch":
-        # Manual runs ignore the clock; the operator decides.
-        _emit("markets", ",".join(candidates))
-        _emit("run", "true")
-        return 0
-
-    open_markets = [market for market in candidates if market_is_open_now(market, now)]
+    # Manual runs ignore the clock; scheduled runs keep only exchanges that are
+    # actually open just after today's close.
+    open_markets = (
+        candidates
+        if event == "workflow_dispatch"
+        else [market for market in candidates if market_is_open_now(market, now)]
+    )
+    # `fromJSON` input for the shard matrix. It must never be empty (GitHub rejects
+    # an empty matrix), and it doubles as the run filter because the `matrix`
+    # context is unavailable in a job-level `if`: when nothing is open, the
+    # `run` output is false and the dependent jobs are skipped entirely.
+    _emit("market_matrix", json.dumps(open_markets or candidates))
     _emit("markets", ",".join(open_markets))
     _emit("run", "true" if open_markets else "false")
     return 0

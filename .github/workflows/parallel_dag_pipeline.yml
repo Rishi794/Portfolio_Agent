@@ -55,6 +55,7 @@ jobs:
     outputs:
       mode: ${{ steps.decide.outputs.mode }}
       markets: ${{ steps.gate.outputs.markets }}
+      market_matrix: ${{ steps.gate.outputs.market_matrix }}
       run_pipeline: ${{ steps.gate.outputs.run }}
       run_label: ${{ steps.decide.outputs.run_label }}
     steps:
@@ -88,14 +89,14 @@ jobs:
   # ------------------------------------------------------------------ stage 1A --
   company-shards:
     needs: prepare
+    # `matrix` is not a valid context in a job-level `if` (GitHub only exposes it
+    # inside steps), so the gate hands us a pre-filtered JSON matrix instead.
+    if: needs.prepare.outputs.run_pipeline == 'true'
     strategy:
       fail-fast: false
       matrix:
-        market: [US, INDIA]
+        market: ${{ fromJSON(needs.prepare.outputs.market_matrix) }}
         shard: [0, 1, 2, 3, 4]
-    if: >
-      needs.prepare.outputs.run_pipeline == 'true' &&
-      contains(needs.prepare.outputs.markets, matrix.market)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
