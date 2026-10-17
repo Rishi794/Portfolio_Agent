@@ -28,6 +28,27 @@ class TableSpec:
 
 
 TABLE_SPECS: dict[str, TableSpec] = {
+    "golden_copy": TableSpec(
+        name="golden_copy",
+        columns={
+            "trade_date": "DATE",
+            "ticker": "VARCHAR",
+            "market": "VARCHAR",
+            "isin": "VARCHAR",
+            "open": "DOUBLE",
+            "high": "DOUBLE",
+            "low": "DOUBLE",
+            "close": "DOUBLE",
+            "volume": "DOUBLE",
+            "dollar_volume_raw": "DOUBLE",
+            "sources_agreed": "INTEGER",
+            "max_dispersion_bps": "DOUBLE",
+            "mad_z_score": "DOUBLE",
+            "golden_status": "VARCHAR",
+            "sha256_proof": "VARCHAR",
+        },
+        primary_key=("market", "ticker", "trade_date"),
+    ),
     "macro_external_pit": TableSpec(
         name="macro_external_pit",
         columns={

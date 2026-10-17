@@ -127,6 +127,10 @@ market_data:
   INDIA:
     primary: nse_bhavcopy_full
     bhavcopy_url_template: "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
+    # Optional second *official* venue print for the 3-source golden-copy quorum
+    # (BSE UDiFF bhavcopy, cross-matched to NSE by ISIN). When empty/unreachable
+    # the ingestor degrades to Yahoo's .BO listing price, then to 2 sources.
+    bse_udiff_url_template: "https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{ddmmyyyy}_F_0000.CSV"
     symbol_suffix: ".NS"
     fallback: yahoo_chart
 

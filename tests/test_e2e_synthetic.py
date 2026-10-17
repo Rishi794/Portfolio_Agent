@@ -104,7 +104,7 @@ def test_issue_and_dashboard_render(e2e: dict, config, tmp_path: Path) -> None:
     html_path = build_dashboard_html(e2e["state_dir"], tmp_path / "index.html")
     html = html_path.read_text(encoding="utf-8")
     assert "plotly" in html
-    assert "V4 Autonomous" in html
+    assert "Open-Aladdin" in html
     assert "__PAYLOAD__" not in html
     payload = html.split("const DATA = ", 1)[1].split(";\nconst CURRENCY", 1)[0]
     parsed = json.loads(payload)
@@ -112,3 +112,33 @@ def test_issue_and_dashboard_render(e2e: dict, config, tmp_path: Path) -> None:
     for book in parsed["books"]:
         assert book["equity"] > 0
         assert book["cash"] <= book["equity"] + 1e-6
+
+
+def test_v5_open_aladdin_layer_and_dashboard(e2e: dict, config, tmp_path: Path) -> None:
+    """V5 layer: compliance gate → Euler/CVaR/stress telemetry → risk_attribution.json."""
+    from src.main_v5 import V5OpenAladdinPipeline
+
+    pipeline = V5OpenAladdinPipeline(e2e["reducer"], config)
+    telemetry = pipeline.process(e2e["summary"])
+
+    assert (e2e["state_dir"] / "risk_attribution.json").exists()
+    assert len(telemetry["merkle_state_hash"]) == 64
+    for market in ("US", "INDIA"):
+        info = telemetry["markets"][market]
+        assert info["port_ann_vol_pct"] >= 0.0
+        assert info["daily_student_t_cvar99_pct"] >= 0.0
+        assert info["ibor_identity_ok"], info["ibor_discrepancy"]
+        assert len(info["ledger_state_sha256"]) == 64
+    # Pending-order contract survives the compliance pass (no golden shards in synthetic).
+    assert telemetry["compliance_gate"]["US"]["approved"] >= 0
+    for path in sorted(e2e["state_dir"].glob("pending_orders*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for order in payload["orders"]:
+            assert order["action"] in {"BUY", "SELL"}
+            assert float(order["shares"]) > 0.0
+
+    html = build_dashboard_html(e2e["state_dir"], tmp_path / "v5.html").read_text(encoding="utf-8")
+    assert "Open-Aladdin" in html
+    assert "Euler" in html
+    parsed = json.loads(html.split("const DATA = ", 1)[1].split(";\nconst CURRENCY", 1)[0])
+    assert "risk" in parsed

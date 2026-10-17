@@ -1,0 +1,78 @@
+# =============================================================================
+# V5 "Open-Aladdin" verification & risk layer.
+#
+# Everything here is a *policy* or *scenario* constant (marked exogenous), never
+# a fitted statistic: the quorum band, the tail probability, the ADV cap and the
+# scenario shocks are risk-appetite declarations. Every statistical quantity
+# (covariance, Student-t tail index, MAD scale, ADV) is estimated from the data
+# at runtime.
+# =============================================================================
+
+quorum:
+  # Risk policy: two independent vendors must land within this band (bps) of the
+  # median print for a bar to be accepted as golden.
+  max_source_divergence_bps: 5.0
+  # Hampel bad-tick cutoff, in robust (MAD * 1.4826) sigmas.
+  mad_sigma_threshold: 8.0
+  # Byzantine floor: fewer independent prints than this -> the bar is dropped.
+  min_sources: 2
+
+risk:
+  # Risk policy: Expected-Shortfall tail probability (99%).
+  cvar_confidence: 0.99
+  # Numerical bounds for the *fitted* Student-t degrees of freedom (fat-tail guard).
+  cvar_nu_bounds: [3.1, 30.0]
+  # Euler additivity is a theorem; the tolerance only absorbs float64 summation.
+  euler_additivity_tolerance: 1.0e-10
+
+compliance:
+  # Risk policy: no single order may exceed this share of 20-day average daily volume.
+  max_adv_participation: 0.05
+
+ibor:
+  # The V4 ledger rounds cash/PnL/fees to 2dp; this tolerance absorbs that rounding
+  # when reconciling the double-entry identity.
+  identity_tolerance: 0.05
+
+# -----------------------------------------------------------------------------
+# External (exogenous) scenario shocks for the Market-Driven Scenario engine.
+# Values are fractional factor moves (0.45 = +45%). Stress *definitions*, not
+# estimated statistics.
+# -----------------------------------------------------------------------------
+stress_scenarios:
+  "2008_LEHMAN_CREDIT_FREEZE":
+    HY_CREDIT_SPREAD: 4.5
+    VIX: 3.8
+    SOX_TECH: -0.28
+    BRENT_OIL: -0.35
+  "2022_STAGFLATION_RATE_SHOCK":
+    US10Y_YIELD: 2.5
+    BRENT_OIL: 0.40
+    DXY_DOLLAR: 0.12
+    SOX_TECH: -0.22
+  "STRAIT_ENERGY_AND_CHIP_BLOCKADE":
+    BRENT_OIL: 0.45
+    SOX_TECH: -0.30
+    USD_INR: 0.06
+    VIX: 2.8
+  "INDIA_FISCAL_CAPEX_SURGE":
+    USD_INR: -0.03
+    BRENT_OIL: -0.15
+    HY_CREDIT_SPREAD: -0.8
+    SOX_TECH: 0.10
+
+# -----------------------------------------------------------------------------
+# Scenario factors are *derived from the live equity cross-section* until richer
+# macro joins land: each factor is a declared linear combination of two base
+# series — the cross-sectional mean daily return ("market_return") and its
+# cross-sectional dispersion ("market_volatility"). Coefficients are exogenous
+# mapping choices, declared here, not fitted values.
+# -----------------------------------------------------------------------------
+proxy_factors:
+  US10Y_YIELD: {market_return: -0.5}
+  BRENT_OIL: {market_return: 0.3}
+  HY_CREDIT_SPREAD: {market_return: -1.2, market_volatility: 1.0}
+  VIX: {market_volatility: 2.0}
+  SOX_TECH: {market_return: 1.3}
+  DXY_DOLLAR: {market_return: -0.35}
+  USD_INR: {market_return: -0.4}

@@ -159,7 +159,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         working-directory: repo
         run: |
-          uv run python -m src.main_v4 \
+          uv run python -m src.main_v5 \
             --mode weekly_deep_sync \
             --target-market BOTH \
             --data-dir ../data_lake \

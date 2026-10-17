@@ -9,7 +9,7 @@
 # wall-clock stays small and the weekly deep sync (separate workflow) carries the long
 # EDGAR/XBRL and patent downloads.
 # =============================================================================
-name: PMS V4 — Parallel DAG EOD
+name: PMS V5 — Open-Aladdin Parallel DAG EOD
 
 on:
   schedule:
@@ -88,9 +88,29 @@ jobs:
           echo "run_label=${MODE}-${{ steps.gate.outputs.markets }}-$(date -u +%Y%m%dT%H%MZ)" >> "$GITHUB_OUTPUT"
           echo "mode=$MODE markets=${{ steps.gate.outputs.markets }} run=${{ steps.gate.outputs.run }}"
 
+  # ------------------------------------------- stage 0.5 (formal proof gate) --
+  verify-invariants:
+    needs: prepare
+    if: needs.prepare.outputs.run_pipeline == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Formal Open-Aladdin invariant gate (quorum, IBOR, Euler, Löwdin, ADV)
+        run: uv run pytest tests/test_aladdin_invariants.py -v
+
   # ------------------------------------------------------------------ stage 1A --
   company-shards:
-    needs: prepare
+    needs: [prepare, verify-invariants]
     # `matrix` is not a valid context in a job-level `if` (GitHub only exposes it
     # inside steps), so the gate hands us a pre-filtered JSON matrix instead.
     if: needs.prepare.outputs.run_pipeline == 'true'
@@ -137,6 +157,16 @@ jobs:
             --output-dir shards \
             --lookback-days 420
 
+      - name: Golden-copy quorum shard (3 independent feeds per market)
+        env:
+          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+        run: |
+          uv run python -m src.ingestion.golden_copy_ingestor \
+            --market ${{ matrix.market }} \
+            --shard-id ${{ matrix.shard }} \
+            --total-shards 5 \
+            --output-dir shards
+
       - uses: actions/upload-artifact@v7
         with:
           name: shards-${{ matrix.market }}-${{ matrix.shard }}
@@ -146,7 +176,7 @@ jobs:
 
   # ------------------------------------------------------------------ stage 1B --
   domain-shards:
-    needs: prepare
+    needs: [prepare, verify-invariants]
     if: needs.prepare.outputs.run_pipeline == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -201,10 +231,11 @@ jobs:
 
   # ------------------------------------------------------------------ stage 2 ---
   fan-in:
-    needs: [prepare, company-shards, domain-shards]
+    needs: [prepare, verify-invariants, company-shards, domain-shards]
     if: >
       always() &&
       needs.prepare.outputs.run_pipeline == 'true' &&
+      needs.verify-invariants.result == 'success' &&
       needs.company-shards.result != 'cancelled' &&
       needs.domain-shards.result != 'cancelled'
     runs-on: ubuntu-latest
@@ -244,12 +275,12 @@ jobs:
           path: staged_shards
           merge-multiple: true
 
-      - name: DuckDB Fan-In reducer (regime → Löwdin → IC-IR → HRP → tickets)
+      - name: V5 Open-Aladdin Fan-In (quorum → regime → Löwdin → IC-IR → HRP → compliance → Euler/CVaR/stress)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         working-directory: repo
         run: |
-          uv run python -m src.main_v4 \
+          uv run python -m src.main_v5 \
             --mode ${{ needs.prepare.outputs.mode }} \
             --target-market ${{ needs.prepare.outputs.markets }} \
             --data-dir ../data_lake \
@@ -269,7 +300,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TITLE="📈 V4 Rebalance Recommendation — $(date -u +%Y-%m-%d)"
+          TITLE="📈 V5 Open-Aladdin Rebalance Recommendation — $(date -u +%Y-%m-%d)"
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then

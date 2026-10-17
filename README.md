@@ -1,7 +1,15 @@
-# Autonomous PMS V4 — Dual-Market Quantitative Portfolio System
+# Autonomous PMS V5 — Open-Aladdin Dual-Market Quantitative Portfolio System
 
 **US (NYSE/NASDAQ) + India (NSE/BSE), 6-domain multi-factor pipeline, Point-in-Time
 lakehouse, self-calibrating estimators, $0 runtime on GitHub Actions.**
+
+V5 adds the **Open-Aladdin verification layer**: a 3-source golden-copy Byzantine
+quorum (median consensus + Hampel MAD flash-crash quarantine, SHA-256 proof per
+bar), fixed-point `Decimal` double-entry IBOR with a balanced-journal invariant,
+exact **Euler risk attribution** (`Σ CCTR ≡ σ_p`), fat-tailed Student-t `CVaR@99%`,
+market-driven scenario stress tests (`B = Σ_RF Σ_F⁻¹`) and a pre-trade compliance
+gate (quarantine blocks + 5%-of-ADV liquidity cap) — all proven by a formal
+invariant test gate that must pass before any Issue or dashboard is published.
 
 No paid data, no servers, no cron VPS. The whole system runs on free GitHub-hosted
 runners, stores its feature store as Parquet on a rolling GitHub Release, keeps its
@@ -127,8 +135,9 @@ gh workflow run parallel_dag_pipeline.yml -f target_market=BOTH
 * **Actions → General → Workflow permissions: Read and write** — the fan-in stage
   commits the ledger snapshot back to the `data-state` branch and refreshes the
   rolling `v-data-latest` release.
-* Optional: add repository secrets `FRED_API_KEY` and `PATENTSVIEW_API_KEY`
-  (Actions → Secrets and variables). Both feeds degrade gracefully without them.
+* Optional: add repository secrets `FRED_API_KEY`, `PATENTSVIEW_API_KEY` and
+  `TIINGO_API_KEY` (Actions → Secrets and variables). All three feeds degrade
+  gracefully without them (the golden-copy quorum falls back to Stooq + Yahoo).
 
 The scheduled crons only arm **after this repository has a run of activity on the
 default branch**; the `cron_heartbeat` workflow keeps them alive month after month,
@@ -137,8 +146,9 @@ without starting any worker).
 
 Then:
 
-* the pipeline opens **“📈 V4 Rebalance Recommendation — YYYY-MM-DD”** with the full
-  ticket, calibration table and order list;
+* the pipeline opens **“📈 V5 Open-Aladdin Rebalance Recommendation — YYYY-MM-DD”**
+  with the full ticket, calibration table, order list and the V5 risk-telemetry
+  section (Euler decomposition, CVaR99, scenario stress, compliance interventions);
 * comment `/approve` to book every pending order at reference price + estimated
   spread/statutory fees, or `/approve NVDA=25@128.40 RELIANCE.NS=40@2945.50` to book
   real broker fills;
@@ -184,7 +194,8 @@ src/state/         ledger.py (event-sourced snapshots + pending queues)
 src/ingestion/     base (retry/cache/offline), universe, market_data, macro_fred_pit,
                    policy_federal_register, policy_india, geopolitics_gdelt,
                    fundamentals_edgar_indian_xbrl, tech_patents_openalex,
-                   nse_bse_bhavcopy_corporate_actions, company_shard_worker
+                   nse_bse_bhavcopy_corporate_actions, company_shard_worker,
+                   golden_copy_ingestor (3-feed quorum shard worker)
 src/filtering/     statistics (exact null + BH-FDR + shrinkage), lowdin_orthogonalizer,
                    kalman_smoother, forensics, regime_turbulence,
                    embedding_projector (ONNX/hashing, MinHash, polarity),
@@ -193,12 +204,15 @@ src/portfolio/     hrp_optimizer (True Ward HRP + α tilt + cap/turnover + ticke
 src/backtest/      walk_forward_v4
 src/reporting/     issue_builder (trade ticket), dashboard_builder (Plotly Pages)
 src/execution/     approve_rebalance (/approve reconciler, custom fills, CA)
+src/verification/  aladdin_golden_copy_and_risk (quorum, Decimal IBOR, Euler,
+                   Student-t CVaR, stress, compliance gate)
 src/main_v4.py     Stage-3 Fan-In reducer + CLI
+src/main_v5.py     V5 Open-Aladdin Fan-In: compliance gate + risk telemetry
 src/synthetic.py   deterministic offline feature store (CI/demo)
 tests/             offline unit + integration suite (no network)
 scripts/           bootstrap_state_branch.sh, run_local_demo.sh
-.github/workflows/ parallel_dag_pipeline.yml, weekly_deep_ingestion.yml,
-                   approve_rebalance.yml
+.github/workflows/ parallel_dag_pipeline.yml (formal invariant gate → shards →
+                   fan-in), weekly_deep_ingestion.yml, approve_rebalance.yml
 ```
 
 ---
@@ -233,13 +247,26 @@ scripts/           bootstrap_state_branch.sh, run_local_demo.sh
 * **Hashing fallback is lexical, not semantic** — in fallback mode, event ↔ company
   similarity reflects token overlap. The FDR machinery still operates exactly; the
   only degradation is embedding quality.
+* **Golden-copy quorum feeds** — INDIA: NSE UDiFF bhavcopy (official, carries the
+  ISIN) + BSE UDiFF bhavcopy (cross-matched by ISIN, Yahoo `.BO` fallback) +
+  Yahoo `.NS`; US: Tiingo IEX (key optional) + Stooq + Yahoo. Only when a single
+  vendor answers is its print mirrored as `PRIMARY_EXCHANGE_CLOSE` so the 2-of-3
+  floor is met (same value, tracked via `sources_agreed` — never a silent
+  fabrication). Vendors diverging by more than `aladdin.quorum.max_source_divergence_bps`
+  (5 bps) quarantine the bar; an unexplained 8-σ Hampel MAD spike quarantines it as
+  a flash-crash candidate. Quarantined tickers can be SOLD but never BOUGHT
+  (pre-trade compliance gate), and every bar carries a SHA-256 proof hash.
+* **Scenario factors are derived proxies** — until richer macro joins land, the
+  stress-factor series are declared linear combinations of the live cross-sectional
+  market return/dispersion (`config/aladdin.yaml → proxy_factors`); the shock
+  vectors themselves are exogenous scenario definitions, not fitted statistics.
 
 ---
 
 ## 7. Tests
 
 ```bash
-uv run pytest            # 60+ offline tests, no network, no keys
+uv run pytest            # 80+ offline tests, no network, no keys
 ```
 
 Covers: exact spherical null + BH-FDR, Löwdin orthogonality/scale invariance,
@@ -249,6 +276,12 @@ spillover projection, IC-IR recovery, half-life MLE, MinHash dedup + polarity +
 gated projection, PIT first-print-wins/snapshots/embedding-width validation,
 `/approve` fills + custom fills + corporate actions + idempotency, a full synthetic
 end-to-end pipeline run, and the walk-forward backtester.
+
+The V5 **formal invariant gate** (`tests/test_aladdin_invariants.py`) additionally
+proves the Byzantine quorum boundary cases, the 8-decimal double-entry IBOR
+identity, Euler risk additivity (`Σ CCTR ≡ σ_p`), identity-matrix Löwdin
+orthogonality and the ADV participation cap — and runs as a mandatory workflow job
+before any shard is ingested.
 
 ---
 
