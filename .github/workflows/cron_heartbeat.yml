@@ -1,0 +1,45 @@
+# =============================================================================
+# PMS V4 — Cron heartbeat.
+#
+# GitHub automatically pauses `schedule` triggers after ~60 days without any
+# activity on the default branch. This workflow touches `.cron_heartbeat` on the
+# 1st–3rd of each month so the trading-day schedules stay armed indefinitely.
+# The commit is idempotent: it is skipped when the current month is already
+# stamped.
+# =============================================================================
+name: PMS V4 — Cron Heartbeat
+
+on:
+  schedule:
+    # 1st-3rd of the month, deliberately off the top of the hour (queue delays).
+    - cron: "37 4 1-3 * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pms-v4-global-state-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commit a monthly heartbeat (idempotent)
+        run: |
+          set -euo pipefail
+          MONTH="$(date -u +%Y-%m)"
+          if [ -f .cron_heartbeat ] && [ "$(cat .cron_heartbeat)" = "$MONTH" ]; then
+            echo "heartbeat already recorded for $MONTH"
+            exit 0
+          fi
+          echo "$MONTH" > .cron_heartbeat
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .cron_heartbeat
+          git commit -m "chore(ci): cron heartbeat $MONTH"
+          git push origin "HEAD:${{ github.ref_name }}"

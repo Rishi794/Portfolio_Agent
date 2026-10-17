@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Local run artefacts (never committed: data ships via GitHub Releases, state via 'data-state' branch)
+data_lake/
+backup_lake/
+incoming_shards/
+shard_out/
+domain_out/
+state_branch/
+state_dev/
+issue_body.md
+*.parquet
+*.log

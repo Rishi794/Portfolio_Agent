@@ -1,0 +1,310 @@
+# =============================================================================
+# PMS V4 — daily parallel DAG: 16-way MapReduce EOD → DuckDB Fan-In → Issue → Pages
+#
+#   prepare ─┬─ company-shards  (US ×5 shards, INDIA ×5 shards: OHLCV + actions + fundamentals)
+#            ├─ domain-shards   (macro PIT, Federal Register, PIB/RBI/SEBI, GDELT, patents)
+#            └─ fan-in          (merge shards → regime → Löwdin → HRP → ticket → Pages)
+#
+# Cost profile: free GitHub-hosted runners only. Heavy network work is sharded so the
+# wall-clock stays small and the weekly deep sync (separate workflow) carries the long
+# EDGAR/XBRL and patent downloads.
+# =============================================================================
+name: PMS V4 — Parallel DAG EOD
+
+on:
+  schedule:
+    # 10:30 UTC = 16:00 IST: 30 min after the 15:30 IST NSE/BSE close.
+    - cron: "30 10 * * 1-5"
+    # US dual schedule: 20:45 UTC fires under EDT, 21:45 UTC under EST. The
+    # Stage-1 gate keeps the slot that is 45 min after the actual (DST-aware)
+    # 16:00 ET close and skips the other.
+    - cron: "45 20 * * 1-5"
+    - cron: "45 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      target_market:
+        description: "Market to run"
+        type: choice
+        options: [BOTH, US, INDIA]
+        default: BOTH
+      mode:
+        description: "Pipeline mode"
+        type: choice
+        options: [auto, daily_eod]
+        default: auto
+
+# One global lock: the data-state branch is single-writer.
+concurrency:
+  group: pms-v4-global-state-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pages: write
+  id-token: write
+
+env:
+  UV_CACHE_DIR: /tmp/uv-cache
+
+jobs:
+  # ------------------------------------------------------------------ stage 0 --
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      markets: ${{ steps.gate.outputs.markets }}
+      run_pipeline: ${{ steps.gate.outputs.run }}
+      run_label: ${{ steps.decide.outputs.run_label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Exchange-calendar gate (holidays + US DST slot)
+        id: gate
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          TARGET_MARKET: ${{ github.event.inputs.target_market || 'BOTH' }}
+        run: |
+          uv run --no-project --with exchange_calendars python scripts/market_open_gate.py
+
+      - name: Decide run parameters
+        id: decide
+        run: |
+          set -euo pipefail
+          MODE="${{ github.event.inputs.mode || 'auto' }}"
+          DOW=$(date -u +%u)   # 7 = Sunday
+          if [ "$MODE" = "auto" ]; then
+            if [ "$DOW" = "7" ]; then MODE="weekly_deep_sync"; else MODE="daily_eod"; fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "run_label=${MODE}-${{ steps.gate.outputs.markets }}-$(date -u +%Y%m%dT%H%MZ)" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE markets=${{ steps.gate.outputs.markets }} run=${{ steps.gate.outputs.run }}"
+
+  # ------------------------------------------------------------------ stage 1A --
+  company-shards:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        market: [US, INDIA]
+        shard: [0, 1, 2, 3, 4]
+    if: >
+      needs.prepare.outputs.run_pipeline == 'true' &&
+      contains(needs.prepare.outputs.markets, matrix.market)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Restore HTTP cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pms_http
+            ~/.cache/pms_sec
+            ~/.cache/pms_nse
+          key: pms-http-${{ matrix.market }}-${{ github.run_id }}
+          restore-keys: pms-http-${{ matrix.market }}-
+
+      - name: Ingest company shard
+        env:
+          SEC_USER_AGENT: "AutonomousPMS/4.0 (github actions; contact: repo owner)"
+        run: |
+          uv run python -m src.ingestion.company_shard_worker \
+            --market ${{ matrix.market }} \
+            --shard-id ${{ matrix.shard }} \
+            --total-shards 5 \
+            --output-dir shards \
+            --lookback-days 420
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shards-${{ matrix.market }}-${{ matrix.shard }}
+          path: shards/
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------ stage 1B --
+  domain-shards:
+    needs: prepare
+    if: needs.prepare.outputs.run_pipeline == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies (with the ONNX semantic backend)
+        run: uv sync --all-extras
+
+      - name: Cache embedding model + HTTP responses
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/onnx_models
+            ~/.cache/pms_http
+          key: pms-models-${{ github.run_id }}
+          restore-keys: pms-models-
+
+      - name: Macro / external Point-in-Time vintages (FRED)
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          uv run python -m src.ingestion.macro_fred_pit --output-dir shards || true
+
+      - name: Event domains → ONNX embeddings → BH-FDR gate
+        run: |
+          for domain in policy_us_fedreg policy_in_pib_rbi_sebi geopol_gdelt; do
+            uv run python -m src.filtering.embedding_projector \
+              --ingest-domain "$domain" --output-dir shards || true
+          done
+
+      - name: Technology evolution (OpenAlex + PatentsView)
+        env:
+          PATENTSVIEW_API_KEY: ${{ secrets.PATENTSVIEW_API_KEY }}
+        run: |
+          uv run python -m src.ingestion.tech_patents_openalex \
+            --output-dir shards --limit 400 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shards-domain
+          path: shards/
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------ stage 2 ---
+  fan-in:
+    needs: [prepare, company-shards, domain-shards]
+    if: >
+      always() &&
+      needs.prepare.outputs.run_pipeline == 'true' &&
+      needs.company-shards.result != 'cancelled' &&
+      needs.domain-shards.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Checkout portfolio state ('data-state' orphan branch)
+        uses: actions/checkout@v4
+        with:
+          ref: data-state
+          path: state_branch
+          fetch-depth: 0
+
+      - name: Restore the lakehouse release cache (previous data_lake)
+        uses: actions/cache@v4
+        with:
+          path: data_lake
+          key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: pms-lake-${{ github.ref_name }}-
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: repo/uv.lock
+
+      - name: Install dependencies
+        working-directory: repo
+        run: uv sync --all-extras
+
+      - name: Download every shard
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shards-*
+          path: staged_shards
+          merge-multiple: true
+
+      - name: DuckDB Fan-In reducer (regime → Löwdin → IC-IR → HRP → tickets)
+        working-directory: repo
+        run: |
+          uv run python -m src.main_v4 \
+            --mode ${{ needs.prepare.outputs.mode }} \
+            --target-market ${{ needs.prepare.outputs.markets }} \
+            --data-dir ../data_lake \
+            --shards-dir ../staged_shards \
+            --state-dir ../state_branch \
+            --output-issue ../issue_body.md \
+            --dashboard-html ../pages_dist/index.html \
+            --backend onnx
+
+      - name: Verify Parquet integrity before publishing
+        working-directory: repo
+        run: uv run python -m src.storage.verify_parquet --data-dir ../data_lake
+
+      - name: Publish/refresh the recommendation Issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="📈 V4 Rebalance Recommendation — $(date -u +%Y-%m-%d)"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file issue_body.md
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --label "rebalance,automation" --body-file issue_body.md
+          fi
+          gh label create rebalance --repo "$GITHUB_REPOSITORY" --color 0E8A16 || true
+          gh label create automation --repo "$GITHUB_REPOSITORY" --color 1D76DB || true
+
+      - name: Commit ledger + dashboard state to 'data-state'
+        run: |
+          set -euo pipefail
+          cd state_branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "chore(state): ${{ needs.prepare.outputs.run_label }}"
+          git push origin HEAD:data-state
+
+      - name: Ship the lakehouse to the rolling v-data-latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd data_lake
+          tar -czf ../lake.tar.gz .
+          cd ..
+          gh release view v-data-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create v-data-latest --repo "$GITHUB_REPOSITORY" --title "Rolling lakehouse" \
+                 --notes "Rotating Point-in-Time Parquet lakehouse (data_lake/*.parquet)"
+          gh release upload v-data-latest lake.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages_dist
+
+  # ------------------------------------------------------------------ stage 3 ---
+  deploy-pages:
+    needs: fan-in
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

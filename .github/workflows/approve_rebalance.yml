@@ -1,0 +1,106 @@
+# =============================================================================
+# PMS V4 — '/approve' execution webhook.
+#
+# Security gate: the job only runs for an issue comment that starts with
+# '/approve' written by the OWNER / MEMBER / COLLABORATOR, and never for PR
+# comments. The state lock is shared with the DAG pipeline so the ledger is
+# single-writer even if an approval lands mid-run.
+# =============================================================================
+name: PMS V4 — Issue '/approve' Execution
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: pms-v4-global-state-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pages: write
+  id-token: write
+
+jobs:
+  reconcile-approved-fills:
+    if: >
+      github.event.issue.pull_request == null &&
+      startsWith(trim(github.event.comment.body), '/approve') &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code (main)
+        uses: actions/checkout@v4
+
+      - name: Checkout portfolio state ('data-state')
+        uses: actions/checkout@v4
+        with:
+          ref: data-state
+          path: state_branch
+          fetch-depth: 0
+
+      - name: Restore the lakehouse (for corporate-action reconciliation)
+        uses: actions/cache/restore@v4
+        with:
+          path: data_lake
+          key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: pms-lake-${{ github.ref_name }}-
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Reconcile fills into the event-sourced ledger
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          uv run python -m src.execution.approve_rebalance \
+            --state-dir state_branch \
+            --comment-body "$COMMENT_BODY" \
+            --issue-number "${{ github.event.issue.number }}" \
+            --actor "${{ github.event.comment.user.login }}" \
+            --receipt-out fill_receipt.md \
+            --lake-dir data_lake
+
+      - name: Rebuild the static dashboard
+        run: |
+          mkdir -p pages_dist
+          uv run python -m src.reporting.dashboard_builder \
+            --state-dir state_branch \
+            --output-html pages_dist/index.html
+
+      - name: Commit the updated ledgers
+        run: |
+          set -euo pipefail
+          cd state_branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "nothing to book (queue was already cleared) — idempotent no-op"
+          else
+            git commit -m "exec(approve): issue #${{ github.event.issue.number }} fills booked by @${{ github.event.comment.user.login }}"
+            git push origin HEAD:data-state
+          fi
+
+      - name: Post the receipt and close the recommendation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --body-file fill_receipt.md
+          gh issue close "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --reason completed
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages_dist
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

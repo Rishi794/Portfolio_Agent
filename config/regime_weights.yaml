@@ -1,0 +1,39 @@
+# =============================================================================
+# Regime weight PRIORS (Tier-1 controller).
+#
+# In V4 these are no longer the operative weights: `factor_learning.mode = ic_ir`
+# learns omega_t from realized rolling Information Coefficients (Grinold-Kahn).
+# The table below is used (a) as the shrinkage prior before enough IC history
+# accumulates, and (b) as an auditable fallback when IC learning is cold.
+#
+# Column order (canonical pillar order everywhere in the codebase):
+#   [kalman_trend, fundamentals, tech_evolution, gov_policy, geopolitics, macro_beta]
+# =============================================================================
+
+pillar_order:
+  - kalman_trend
+  - fundamentals
+  - tech_evolution
+  - gov_policy
+  - geopolitics
+  - macro_beta
+
+regimes:
+  LOW_VOL_EXPANSION:
+    description: "Low-Vol Expansion (Goldilocks): growth positive, inflation contained, credit calm."
+    weights: [0.28, 0.22, 0.24, 0.10, 0.08, 0.08]
+    cash_range: [0.03, 0.06]
+  INFLATIONARY_BOOM:
+    description: "Inflationary Reflation: nominal growth hot, real yields rising, commodity beta pays."
+    weights: [0.22, 0.26, 0.14, 0.14, 0.10, 0.14]
+    cash_range: [0.06, 0.12]
+  STAGFLATION_STRESS:
+    description: "Stagflation / Policy Stress: sticky inflation with deteriorating credit."
+    weights: [0.12, 0.34, 0.10, 0.18, 0.14, 0.12]
+    cash_range: [0.15, 0.28]
+  CRISIS_TURBULENCE:
+    description: "Crisis / High Turbulence: turbulence above the chi2 90th percentile."
+    weights: [0.08, 0.38, 0.06, 0.16, 0.18, 0.14]
+    cash_range: [0.30, 0.45]
+
+fallback_regime: LOW_VOL_EXPANSION

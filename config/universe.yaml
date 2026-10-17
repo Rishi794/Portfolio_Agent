@@ -1,0 +1,129 @@
+# =============================================================================
+# Dual-market universe + zero-cost data source registry.
+# Everything here is a *source of truth for endpoints*, not a statistical prior.
+# =============================================================================
+
+markets:
+  US:
+    calendar: XNYS
+    timezone: America/New_York
+    currency: USD
+    benchmark: ^GSPC
+    shards: 5
+    max_symbols: 500
+    statutory_cost_profile: US
+    instruments: [equity]
+    universe_source:
+      type: sec_company_tickers          # https://www.sec.gov/files/company_tickers.json
+      url: https://www.sec.gov/files/company_tickers.json
+      priority_exchanges: [NYSE, Nasdaq, NYSE American, NYSE Arca, Cboe]
+  INDIA:
+    calendar: XBOM
+    timezone: Asia/Kolkata
+    currency: INR
+    benchmark: ^NSEI
+    shards: 5
+    max_symbols: 500
+    statutory_cost_profile: INDIA
+    instruments: [equity]
+    universe_source:
+      type: nse_index_csv
+      url: https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv
+      symbol_column: Symbol
+      sector_column: "Industry"
+      name_column: "Company Name"
+
+# --------------------------------------------------------------------------
+# Cross-asset / external market factor registry (Yahoo Finance chart API, free,
+# no key). Fallback for US close: Stooq daily CSV.
+# --------------------------------------------------------------------------
+cross_assets:
+  sources:
+    primary: yahoo_chart
+    fallback: stooq_csv
+  symbols:
+    VIX: ^VIX
+    DXY: DX-Y.NYB
+    BRENT: BZ=F
+    GOLD: GC=F
+    COPPER: HG=F
+    SOX: ^SOX
+    NASDAQ100: ^NDX
+    RUSSELL2000: ^RUT
+    UST10Y_TNX: ^TNX              # nominal 10Y yield proxy (FRED DFII10/DGS10 are the PIT series)
+
+# --------------------------------------------------------------------------
+# FRED / ALFRED Point-in-Time macro registry (realtime_start = vintage).
+# Requires the free FRED_API_KEY secret; the pipeline degrades gracefully
+# (macro pillar falls back to cross-asset proxies) when absent.
+# --------------------------------------------------------------------------
+fred_series:
+  T10Y2Y: YIELD_CURVE_10Y2Y
+  BAMLH0A0HYM2: HY_CREDIT_SPREAD
+  CPIAUCSL: CPI_INDEX
+  CPILFESL: CORE_CPI_INDEX
+  WM2NS: M2_LIQUIDITY
+  INDPRO: INDUSTRIAL_PRODUCTION
+  DFII10: US10Y_REAL_YIELD
+  DGS10: US10Y_NOMINAL
+  PAAYEME: US_EMPLOYMENT
+# India macro (RBI DBIE / MOSPI) is ingested via the PIB + RBI collectors.
+india_macro_proxies: [USDINR, BRENT, NIFTY_ROLLING_BETA]
+
+# --------------------------------------------------------------------------
+# Event / policy / technology source registry.
+# --------------------------------------------------------------------------
+event_sources:
+  us_policy:
+    endpoint: https://www.federalregister.gov/api/v1/documents.json
+    agencies: [commerce-department, energy-department, defense-department,
+               food-and-drug-administration, environmental-protection-agency,
+               treasury-department, securities-and-exchange-commission]
+    document_types: [RULE, PRESDOCU]
+    domain: GOV_POLICY
+  india_policy:
+    feeds:
+      - [INDIA_PIB_CABINET, "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3"]
+      - [INDIA_PIB_ALL, "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=0"]
+      - [INDIA_RBI_POLICY, "https://rbi.org.in/pressreleases_rss.xml"]
+      - [INDIA_SEBI_REG, "https://www.sebi.gov.in/sebirss.xml"]
+    domain: GOV_POLICY_INDIA
+  geopolitics:
+    endpoint: https://api.gdeltproject.org/api/v2/doc/doc
+    queries:
+      GEOPOL_GLOBAL: '(sanctions OR blockade OR tariff OR "export control" OR strait OR "supply chain") sourcelang:eng'
+      POLITICAL_INDIA: '(India AND (cabinet OR parliament OR election OR PLI OR budget OR coalition OR RBI)) sourcelang:eng'
+  technology:
+    openalex_institutions: https://api.openalex.org/institutions
+    openalex_works: https://api.openalex.org/works
+    patentsview_search: https://search.patentsview.org/api/v1/patent/
+  sanctions:
+    ofac_sdn: https://sanctionslistservice.ofac.treas.gov/api/download/sdn.csv
+    eu_consolidated: https://webgate.ec.europa.eu/fsd/fsf/public/files/csvFullSanctionsList_1_1/content
+
+# --------------------------------------------------------------------------
+# Market data (OHLCV) endpoints.
+# --------------------------------------------------------------------------
+market_data:
+  US:
+    primary: yahoo_chart
+    fallback: stooq_csv
+    stooq_symbol_template: "{symbol_lower}.us"
+  INDIA:
+    primary: nse_bhavcopy_full
+    bhavcopy_url_template: "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
+    symbol_suffix: ".NS"
+    fallback: yahoo_chart
+
+# --------------------------------------------------------------------------
+# GitHub Release lakehouse layout.
+# --------------------------------------------------------------------------
+lakehouse:
+  data_release_tag: v-data-latest
+  backup_release_tag: v-data-prev
+  state_branch: data-state
+  compression: zstd
+
+indices_for_spillover:
+  provider: [SOX, NASDAQ100, UST10Y_TNX, DXY, BRENT, RUSSELL2000]
+  adr_proxies: [INFY, WIT, HDB, IBN, RDY]

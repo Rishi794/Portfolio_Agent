@@ -1,0 +1,234 @@
+# =============================================================================
+# PMS V4 — weekly deep sync.
+#
+#   • full SEC EDGAR companyfacts (all XBRL periods) + 10-K Item 1 business text
+#   • India NSE/BSE Ind-AS results + Regulation 31 promoter pledge / FII-DII
+#   • OpenAlex + USPTO PatentsView technology velocity
+#   • walk-forward validation on the refreshened Point-in-Time lakehouse
+#   • dashboard + Pages redeploy
+#
+# Runs Sunday 22:00 UTC. Targets validate/refresh the slow-moving pillars that the
+# daily fast path intentionally skips.
+# =============================================================================
+name: PMS V4 — Weekly Deep Ingestion
+
+on:
+  schedule:
+    - cron: "0 22 * * 0"          # Sunday 22:00 UTC (Monday 03:30 IST)
+  workflow_dispatch:
+
+concurrency:
+  group: pms-v4-global-state-lock
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pages: write
+  id-token: write
+
+env:
+  UV_CACHE_DIR: /tmp/uv-cache
+
+jobs:
+  deep-company-shards:
+    strategy:
+      fail-fast: false
+      matrix:
+        market: [US, INDIA]
+        shard: [0, 1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --all-extras
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pms_sec
+            ~/.cache/pms_nse
+            ~/.cache/pms_http
+            ~/.cache/onnx_models
+          key: pms-deep-${{ matrix.market }}-${{ github.run_id }}
+          restore-keys: pms-deep-${{ matrix.market }}-
+
+      - name: Deep fundamentals + long OHLCV history shard
+        run: |
+          uv run python -m src.ingestion.company_shard_worker \
+            --market ${{ matrix.market }} \
+            --shard-id ${{ matrix.shard }} \
+            --total-shards 5 \
+            --output-dir shards \
+            --lookback-days 1500 \
+            --backend onnx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deep-${{ matrix.market }}-${{ matrix.shard }}
+          path: shards/
+          retention-days: 5
+          if-no-files-found: warn
+
+  deep-tech-shards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --all-extras
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pms_openalex
+            ~/.cache/pms_http
+          key: pms-deep-tech-${{ github.run_id }}
+          restore-keys: pms-deep-tech-
+
+      - name: Patents / publications / R&D velocity
+        env:
+          PATENTSVIEW_API_KEY: ${{ secrets.PATENTSVIEW_API_KEY }}
+        run: |
+          for shard in 0 1 2 3 4; do
+            uv run python -m src.ingestion.tech_patents_openalex \
+              --output-dir shards --limit 500 \
+              --shard-id "$shard" --total-shards 5 || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deep-tech
+          path: shards/
+          retention-days: 5
+          if-no-files-found: warn
+
+  validate-and-publish:
+    needs: [deep-company-shards, deep-tech-shards]
+    if: always() && needs.deep-company-shards.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - uses: actions/checkout@v4
+        with:
+          ref: data-state
+          path: state_branch
+          fetch-depth: 0
+
+      - uses: actions/cache@v4
+        with:
+          path: data_lake
+          key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: pms-lake-${{ github.ref_name }}-
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: repo/uv.lock
+
+      - name: Install dependencies
+        working-directory: repo
+        run: uv sync --all-extras
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deep-*
+          path: staged_shards
+          merge-multiple: true
+
+      - name: Fan-In (weekly deep sync)
+        working-directory: repo
+        run: |
+          uv run python -m src.main_v4 \
+            --mode weekly_deep_sync \
+            --target-market BOTH \
+            --data-dir ../data_lake \
+            --shards-dir ../staged_shards \
+            --state-dir ../state_branch \
+            --output-issue ../issue_body.md \
+            --dashboard-html ../pages_dist/index.html \
+            --backend onnx
+
+      - name: Point-in-Time walk-forward validation (both markets)
+        working-directory: repo
+        run: |
+          uv run python -m src.backtest.walk_forward_v4 \
+            --lake-dir ../data_lake \
+            --state-dir ../state_branch \
+            --market BOTH | tee ../backtest_summary.json
+
+      - name: Verify Parquet integrity
+        working-directory: repo
+        run: uv run python -m src.storage.verify_parquet --data-dir ../data_lake
+
+      - name: Rebuild dashboard with the fresh NAV curves
+        working-directory: repo
+        run: |
+          uv run python -m src.reporting.dashboard_builder \
+            --state-dir ../state_branch \
+            --output-html ../pages_dist/index.html
+
+      - name: Commit state
+        run: |
+          set -euo pipefail
+          cd state_branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "chore(state): weekly deep sync $(date -u +%Y-%m-%d)"
+          git push origin HEAD:data-state
+
+      - name: Publish the weekly report as an Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="🧪 V4 Weekly Deep Sync & Walk-Forward — $(date -u +%Y-%m-%d)"
+          {
+            echo "## Trade ticket (weekly deep sync)"
+            echo
+            cat issue_body.md
+            echo
+            echo "## Walk-forward (net of Corwin-Schultz spread + statutory fees + KKT deadbands)"
+            echo
+            echo '```json'
+            cat backtest_summary.json
+            echo '```'
+          } > weekly_report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+            --label automation --body-file weekly_report.md || true
+
+      - name: Ship the lakehouse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd data_lake
+          tar -czf ../lake.tar.gz .
+          cd ..
+          gh release view v-data-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create v-data-latest --repo "$GITHUB_REPOSITORY" --title "Rolling lakehouse" \
+                 --notes "Rotating Point-in-Time Parquet lakehouse (data_lake/*.parquet)"
+          gh release upload v-data-latest lake.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages_dist
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

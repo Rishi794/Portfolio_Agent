@@ -1,0 +1,37 @@
+# =============================================================================
+# Polarity supervision for the event store.
+#
+# Tailwind/headwind semantics are defined ONCE here and used in two ways:
+#   1. semantic backend (ONNX bge-small-en-v1.5): the two anchor paragraphs are
+#      embedded and the difference vector becomes the polarity axis; an event's
+#      polarity is tanh(4 * projection) — no keyword matching at all.
+#   2. hashing fallback backend (offline CI): an explicitly documented,
+#      config-driven lexicon score, so that a networkless smoke test still
+#      produces a signed policy signal. The mode actually used is printed in the
+#      trade ticket so nobody mistakes the fallback for the real semantic model.
+# =============================================================================
+
+axis_anchors:
+  tailwind: >-
+    Government subsidy approval, Production Linked Incentive grant, tax cut,
+    infrastructure capital expenditure expansion, rate cut, defence order award,
+    regulatory clearance, export licence granted, tariff reduction.
+  headwind: >-
+    Export ban, punitive tariff hike, windfall tax, regulatory penalty, risk weight
+    tightening, sanctions blockade, antitrust probe, procurement freeze, licence
+    revocation, supply chain blockade.
+
+fallback_lexicon:
+  tailwind_terms:
+    [approve, approved, approval, subsidy, incentive, pli, cut, reduction, exemption,
+     clearance, grant, awarded, award, expansion, capex, investment, investment,
+     reform, simplified, eased, liberalised, liberalized, refund, rebate, hike in
+     outlay, production linked, memorandum, partnership, collaboration, order]
+  headwind_terms:
+    [ban, banned, prohibition, penalty, fine, probe, investigation, antitrust, raid,
+     sanction, sanctioned, embargo, blockade, tariff hike, windfall, dispute,
+     default, downgrade, recall, fraud, misstatement, tightening, freeze, halt,
+     suspension, cancelled, revoke, revoked, seizure, restriction, safeguard duty]
+
+lexicon_scale: 1.5
+axis_projection_scale: 4.0

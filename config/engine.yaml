@@ -1,0 +1,201 @@
+# =============================================================================
+# Autonomous PMS V4 — engine configuration.
+#
+# DESIGN RULE: no numeric constant is hardcoded in src/. Every estimator either
+# (a) derives its parameter in closed form from the data, or (b) reads a *prior*
+# from this file. Where a value is a Bayesian prior (not a hard threshold) it is
+# explicitly marked "prior". Where a value is fixed by statute / exogenous law
+# (e.g. Beneish's published -1.78 cut, Indian STT) it is marked "statutory".
+# =============================================================================
+
+# ---------------------------------------------------------------- macro ----
+macro:
+  delta_lookback_days: 20            # 20d change windows for curve / credit / FX / oil
+  zscore_lookback_days: 252
+  min_observations: 60               # below this the regime detector returns its prior
+  vix_percentile_window: 252
+  cpi_ma_months: 12                  # CPI surprise = YoY inflation - 12m moving average
+  winsor_quantile: 0.01
+  # Weekly/monthly series are forward-filled onto the daily grid; the limit must cover
+  # one print cycle (monthly CPI / weekly claims) or the column would go stale-NaN.
+  ffill_limit_days: 40
+  # Knowledge timestamp for macro prints: end of the release day in UTC. This is a
+  # *timing* constant (when the print becomes public), not a statistical parameter.
+  vintage_hour_utc: 23
+
+# ------------------------------------------------------------ turbulence ---
+# Mahalanobis turbulence d^2 ~ chi2(df). q_90 is the analytic chi2 anchor.
+turbulence:
+  chi2_df: 6
+  chi2_q_90: 10.64                   # prior (exact chi2 value: 10.6446)
+  cash_min: 0.03
+  cash_max: 0.45
+  gamma_m: 0.5                       # prior slope of the sigmoid cash scaling law
+  shrinkage: ledoit_wolf
+  min_observations: 30
+  classification:                    # priors: fallback regime label when IC learning is cold
+    crisis_d2: 12.5
+    crisis_hy_z: 1.5
+    stagflation_cpi_z: 0.75
+    stagflation_hy_z: 0.5
+    reflation_cpi_z: 0.5
+
+# --------------------------------------------------------------- lowdin ----
+lowdin:
+  winsor_quantile: 0.02
+  eigenvalue_floor: 1.0e-4
+  min_observations: 8                # N <= K -> return standardized factors untouched
+
+# --------------------------------------------------------------- kalman ----
+# Q_t and R_t are LEARNED (Myers-Tapley innovation covariance matching).
+# Only windows and numerical floors are configured here.
+kalman:
+  min_observations: 10
+  window_sqrt_scale: 1.0             # W = max(min_window, int(sqrt(n) * scale))
+  min_window: 10
+  init_process_frac: [0.10, 0.01]    # prior split of initial variance across [level, velocity]
+  innovation_floor: 1.0e-10
+  eigenvalue_floor: 1.0e-10
+  velocity_scale_floor: 1.0e-8
+
+# --------------------------------------------------------------- events ----
+events:
+  embedding_dim: 384
+  fdr_alpha_scale: 1.0               # alpha_FDR = scale / sqrt(M)
+  fdr_min_pairs: 100
+  fdr_fallback_p: 0.05
+  # Used ONLY when the semantic backend is the dependency-free hashing
+  # fallback (offline CI) or when no events exist. Reported in the trade ticket.
+  gate_tau_prior: 0.62
+  prior_eta: 1.0
+  half_life_default_days:
+    GOV_POLICY: 60.0                 # enacted policy persists (prior)
+    GOV_POLICY_INDIA: 60.0
+    GOVERNMENT_POLICY: 60.0
+    GEOPOLITICAL: 14.0
+    GEOPOL_GLOBAL: 14.0
+    GEOPOL_INDIA: 14.0
+    POLITICAL_INDIA: 21.0
+  half_life_min_days: 3.0
+  half_life_max_days: 180.0
+  # Which event domains feed each market's policy / geopolitics pillars.
+  market_domains:
+    US:
+      gov_policy: [GOV_POLICY]
+      geopolitics: [GEOPOLITICAL]
+    INDIA:
+      gov_policy: [GOV_POLICY_INDIA]
+      geopolitics: [GEOPOLITICAL, GEOPOL_GLOBAL, GEOPOL_POLITICAL_INDIA, POLITICAL_INDIA]
+  impulse_horizon_days: 40           # tau = 1..L in the IR-MLE half-life regression
+  authority_weights:
+    final_rule: 1.0
+    enacted_statute: 1.0
+    executive_order: 0.85
+    proposed_rule: 0.40
+    press_rhetoric: 0.05
+    gdelt: 0.75
+    goldstein_scale_max: 10.0
+    gdelt_mention_saturation: 100.0
+
+# ------------------------------------------------------------- spillover ---
+# US -> India overnight lead-lag projection (Ledoit-Wolf joint covariance).
+spillover:
+  min_observations: 30
+  provider_market: US
+  consumer_market: INDIA
+  blend_weight: 0.5                  # prior weight of the spillover leg inside External Macro Beta
+  adr_beta_floor: 0.0
+
+# --------------------------------------------------- tech evolution score ---
+# T = w1*Z_sector(patent acceleration) + w2*Z_sector(productive R&D) + w2*Z_sector(CapEx modernisation)
+tech_evolution:
+  weights: [0.45, 0.35, 0.20]
+  min_sector_cross_section: 5
+
+# ------------------------------------------- macro/external beta regression ---
+macro_beta:
+  ridge_lambda: 1.0e-3               # closed-form ridge on standardized macro shocks
+  min_observations: 60
+  lookback_days: 252
+
+
+# ----------------------------------------------------------------- costs ---
+# Statutory exchange friction (exogenous law, not a tunable knob).
+costs:
+  markets:
+    INDIA:
+      # NSE/BSE delivery: STT 0.10% + stamp duty 0.015% + NSE txn 0.00322%
+      # + SEBI turnover 0.0001% + 18% GST on (txn + SEBI) ~= 11.9 bps round-trip one-way
+      stt_pct: 0.0010
+      stamp_duty_pct: 0.00015
+      exchange_txn_pct: 0.0000322
+      sebi_turnover_pct: 0.000001
+      gst_on_fees_pct: 0.18
+    US:
+      # SEC Section 31 fee on sales ($27.80 per $1M => 0.278 bps) + FINRA TAF
+      # ($0.000166/share ~ 0.02 bps on a $100 stock).
+      sec_section_31_bps: 0.278
+      finra_taf_bps: 0.020
+  impact:
+    sqrt_law_coefficient: 1.0        # c_impact = coeff * sigma * sqrt(order/ADV)
+  corwin_schultz:
+    window: 20
+    denom_floor: 1.0e-8
+  risk_aversion_floor: 0.25
+
+# ------------------------------------------------------------- optimizer ---
+optimizer:
+  hrp_linkage: ward
+  distance_metric: correlation
+  alpha_tilt_strength: 0.35          # prior: how hard HRP base risk weights tilt to alpha
+  cov_lookback_days: 160             # return window for the HRP covariance / cluster distance
+  max_weight: 0.06
+  min_position_value: 1000.0
+  deadband_scale: 1.0                # prior multiplier on the closed-form KKT deadband
+  max_turnover: 0.35
+  leverage: 1.0
+  cov_shrinkage: ledoit_wolf
+  wacc:
+    # CAPM cost of equity: rf + beta * ERP, rf proxied by the PIT 10Y real yield.
+    equity_risk_premium: 0.045
+    crypto_placeholder: null
+    min_wacc: 0.06
+    max_wacc: 0.18
+    effective_tax_rate: 0.25
+
+# ------------------------------------------------------------- forensics ---
+forensics:
+  gate_mode: quantile                # 'quantile' (endogenous) | 'statutory'
+  statutory_beneish_gate: -1.78      # statutory: Beneish (1999) published cut-off
+  statutory_piotroski_gate: 6
+  survival_quantile: 0.35            # endogenous: lowest-hazard 35% survive per sector
+  min_cross_section: 30
+  min_dollar_volume: 15000000.0
+  winsor_quantile: 0.01
+  quality_weights: [0.45, 0.35, 0.20]  # ROIC-WACC, FCF/EV, F-Score (spec-fixed blend)
+
+# --------------------------------------------------------- fundamentals ----
+fundamentals:
+  # Conservative reporting-lag fallback when an exchange API does not expose the
+  # exact acceptance timestamp (India quarterly results): knowledge_timestamp =
+  # period_end + lag. Conservative lags can only delay a signal, never leak one.
+  india_reporting_lag_days: 45
+  business_text_max_chars: 6000
+  price_lookback_days: 400           # window used for beta / dollar volume / volatility
+  min_price_observations: 60
+  nse_session_priming: true
+  sec_requests_per_second: 8         # SEC fair-access policy
+
+# ------------------------------------------------ IC-IR factor weighting ---
+factor_learning:
+  mode: ic_ir                       # 'ic_ir' (endogenous) | 'regime_prior'
+  horizon_days: 5                    # forward return horizon h for the IC regression
+  min_ic_observations: 5
+  prior_precision_scale: 1.0         # nu_0 = scale / sqrt(W_IC)
+  min_weight_floor: 0.0              # factors with non-positive IC -> weight 0 (no shorting alpha)
+
+# ------------------------------------------------------------- reporting ---
+reporting:
+  top_n_display: 25
+  max_events_display: 15
+  currency_decimals: 2
