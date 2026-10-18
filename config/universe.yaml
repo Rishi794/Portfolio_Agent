@@ -105,6 +105,8 @@ event_sources:
     domain: GOV_POLICY_INDIA
   geopolitics:
     endpoint: https://api.gdeltproject.org/api/v2/doc/doc
+    # Documented pacing (429 text replies otherwise): one call per 5 seconds.
+    min_interval_seconds: 5.0
     queries:
       GEOPOL_GLOBAL: '(sanctions OR blockade OR tariff OR "export control" OR strait OR "supply chain") sourcelang:eng'
       POLITICAL_INDIA: '(India AND (cabinet OR parliament OR election OR PLI OR budget OR coalition OR RBI)) sourcelang:eng'

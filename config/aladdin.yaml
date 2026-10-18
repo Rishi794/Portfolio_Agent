@@ -115,5 +115,8 @@ timestral:
   cpu_threads: null
   # true = never touch the Hub; read the checkpoint from the restored cache only.
   local_files_only: false
+  # Hard deadline for the cold-cache checkpoint download. A stalled Hub transfer
+  # must degrade to the empirical fallback, never hang the fan-in job.
+  load_timeout_seconds: 300
   # true = a missing/broken checkpoint aborts the run instead of degrading silently.
   require_model: false

@@ -110,6 +110,47 @@ def test_statutory_gate_mode_uses_published_cuts() -> None:
     assert mask.tolist() == [True, False, False, True]
 
 
+def test_quantile_gate_handles_nullable_int_scores() -> None:
+    """Real Parquet shards store Piotroski scores as nullable Int64 with ``pd.NA``.
+
+    Clipping a nullable integer column with float quantile bounds raises
+    ``TypeError: Invalid value '2.37' for dtype 'Int64'`` on pandas >= 3, so the
+    forensic risk index must coerce to float64 first (seen in the daily cron's
+    fan-in once a sector reached the 30-name cross-section).
+    """
+    rng = np.random.default_rng(11)
+    n = 120
+    # A sparse low tail (scores 2, 3, 5 then 6s) makes the winsorised 1% quantile
+    # a *fractional* float — exactly what a nullable Int64 array cannot accept.
+    scores = np.full(n, 6, dtype=int)
+    for start in (0, 60):
+        scores[start], scores[start + 1], scores[start + 2] = 2, 3, 5
+    beneish = pd.array(rng.normal(-2.0, 0.5, n), dtype="Float64")
+    beneish[::9] = pd.NA  # the earlier "boolean value of NA" gate crash
+    frame = pd.DataFrame(
+        {
+            "beneish_m_score": beneish,
+            "piotroski_f_score": pd.array(scores, dtype="Int64"),
+            "promoter_pledge_pct": pd.array(np.abs(rng.normal(5, 8, n)), dtype="Float64"),
+            "gics_sector": ["Technology"] * 60 + ["Industrials"] * 60,
+            "dollar_volume_20d": rng.uniform(1e7, 1e9, n),
+        },
+        index=[f"T{i}" for i in range(n)],
+    )
+    thresholds = estimate_survival_gate(
+        frame, _config(gate_mode="quantile", survival_quantile=0.35, min_cross_section=50)
+    )
+    technology = thresholds["Technology"]
+    assert technology.mode == "quantile"
+    assert np.isfinite(technology.beneish_max)
+    assert np.isfinite(technology.fscore_min)
+    mask = gate_mask(frame, thresholds, min_dollar_volume=1e7)
+    assert mask.dtype == bool and len(mask) == n
+    risk = forensic_risk_index(frame, 0.01)
+    assert risk.dtype == np.float64
+    assert np.isfinite(risk.to_numpy()).all()
+
+
 def test_quantile_gate_is_endogenous_per_sector() -> None:
     rng = np.random.default_rng(3)
     n = 120

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -176,12 +177,44 @@ class TimestralForecastEngine:
                 kwargs["device"] = self.device
             if self.local_files_only:
                 kwargs["local_files_only"] = True
-            self._forecaster = TimestralForecaster.from_pretrained(self.model_id, **kwargs)
+            self._forecaster = self._load_with_timeout(kwargs)
         except Exception as error:  # noqa: BLE001 - degrade, never crash the fan-in
             self._load_error = f"{type(error).__name__}: {error}"
             if self.require_model:
                 raise
             self._forecaster = None
+
+    def _load_with_timeout(self, kwargs: dict[str, Any]) -> Any:
+        """Load the checkpoint with a hard deadline (``timestral.load_timeout_seconds``).
+
+        ``from_pretrained`` on a cold cache can stall on the Hub/CDN indefinitely
+        (a 0-byte blob observed); without a deadline the whole fan-in would be
+        killed by the job timeout instead of degrading to the empirical fallback.
+        The loader runs on a daemon thread so an abandoned transfer never blocks
+        process exit; a warm cache (the workflow's model cache) loads in seconds.
+        """
+        timeout = float(_cfg(self.config, "timestral.load_timeout_seconds", 300.0) or 0.0)
+        if timeout <= 0:
+            return TimestralForecaster.from_pretrained(self.model_id, **kwargs)
+
+        outcome: dict[str, Any] = {}
+
+        def _load() -> None:
+            try:
+                outcome["forecaster"] = TimestralForecaster.from_pretrained(self.model_id, **kwargs)
+            except Exception as error:  # noqa: BLE001 - re-raised on the caller thread
+                outcome["error"] = error
+
+        worker = threading.Thread(target=_load, name="timestral-load", daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"Timestral checkpoint load exceeded {timeout:.0f}s (cold or stalled Hub download)"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["forecaster"]
 
     # ------------------------------------------------------------- covariates --
     @staticmethod

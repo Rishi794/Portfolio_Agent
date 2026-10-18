@@ -144,6 +144,18 @@ jobs:
           key: pms-http-${{ matrix.market }}-${{ github.run_id }}
           restore-keys: pms-http-${{ matrix.market }}-
 
+      # The Stage-2A shards embed 10-K business descriptions with the same 33 MB
+      # quantized BGE model as the domain shards. Without this cache every one of
+      # the ten parallel jobs re-downloads it from the Hub on a cold runner; the
+      # unauthenticated HF request in turn is what intermittently answers
+      # "The operation was canceled." when the Hub rate-limits the runner IP.
+      - name: Cache ONNX BGE model
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/onnx_models
+          key: pms-onnx-bge-v1
+          restore-keys: pms-onnx-bge-
+
       - name: Ingest company shard
         env:
           # SEC answers 403 to generic User-Agents; a real contact address is
@@ -199,6 +211,7 @@ jobs:
           path: |
             ~/.cache/onnx_models
             ~/.cache/pms_http
+            ~/.cache/pms_openalex
           key: pms-models-${{ github.run_id }}
           restore-keys: pms-models-
 
@@ -221,8 +234,11 @@ jobs:
         env:
           PATENTSVIEW_API_KEY: ${{ secrets.PATENTSVIEW_API_KEY }}
         run: |
+          # OpenAlex throttles shared runner IPs; the crawl budget guarantees the
+          # step always writes a partial shard (warm caches cover the remainder on
+          # the next run) instead of being job-killed with nothing to upload.
           uv run python -m src.ingestion.tech_patents_openalex \
-            --output-dir shards --limit 400 || true
+            --output-dir shards --limit 400 --max-minutes 20 || true
 
       - uses: actions/upload-artifact@v7
         with:
@@ -294,6 +310,11 @@ jobs:
       - name: V5 Open-Aladdin Fan-In (quorum → regime → Löwdin → IC-IR → HRP → compliance → Euler/CVaR/stress)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # The Timestral checkpoint is fetched with the classic HTTP path instead
+          # of xet: xet transfers spawn non-daemon native threads that block
+          # interpreter shutdown when a cold-cache download stalls, which would
+          # otherwise leave this step running until the job timeout.
+          HF_HUB_DISABLE_XET: "1"
         working-directory: repo
         run: |
           uv run python -m src.main_v5 \

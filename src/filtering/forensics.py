@@ -259,7 +259,10 @@ def forensic_risk_index(frame: pd.DataFrame, winsor_quantile: float) -> pd.Serie
     def z(column: str) -> pd.Series:
         if column not in frame.columns:
             return pd.Series(0.0, index=frame.index, dtype="float64")
-        values = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+        # Nullable integer dtypes (real Parquet fundamentals) cannot be clipped
+        # with float quantile bounds on pandas >= 3 (TypeError: Invalid value
+        # '2.37' for dtype 'Int64'); coerce to float64 before fillna/clip.
+        values = pd.to_numeric(frame[column], errors="coerce").astype("float64").fillna(0.0)
         if winsor_quantile > 0:
             values = values.clip(values.quantile(winsor_quantile), values.quantile(1 - winsor_quantile))
         std = float(values.std(ddof=0))
@@ -296,9 +299,14 @@ def estimate_survival_gate(
         keep = block.loc[risk <= cutoff]
         if keep.empty:
             continue
+        # ``to_numeric`` keeps pandas nullable dtypes (NA) as-is, and float(pd.NA)
+        # raises; coerce to float64 first so missing scores become plain NaN and the
+        # derived threshold falls back to the statutory prior.
+        derived_beneish = pd.to_numeric(keep["beneish_m_score"], errors="coerce").astype("float64").max()
+        derived_fscore = pd.to_numeric(keep["piotroski_f_score"], errors="coerce").astype("float64").min()
         thresholds[str(sector)] = GateThresholds(
-            beneish_max=float(pd.to_numeric(keep["beneish_m_score"], errors="coerce").max()),
-            fscore_min=float(pd.to_numeric(keep["piotroski_f_score"], errors="coerce").min()),
+            beneish_max=float(derived_beneish) if pd.notna(derived_beneish) else statutory.beneish_max,
+            fscore_min=float(derived_fscore) if pd.notna(derived_fscore) else statutory.fscore_min,
             mode="quantile",
             sample_size=int(len(block)),
             source=f"survival_q={survival_q:.2f}",
@@ -320,8 +328,19 @@ def gate_mask(
     mask = pd.Series(False, index=frame.index)
     fallback = thresholds.get("__GLOBAL__", _statutory_thresholds_stub())
     sectors = frame[sector_column] if sector_column in frame.columns else pd.Series("__GLOBAL__", index=frame.index)
-    beneish = pd.to_numeric(frame.get("beneish_m_score", pd.Series(np.nan, index=frame.index)), errors="coerce")
-    fscore = pd.to_numeric(frame.get("piotroski_f_score", pd.Series(np.nan, index=frame.index)), errors="coerce")
+    # Coerce to float64 so nullable-dtype missing values (pd.NA from real Parquet
+    # shards) become np.nan: ``np.isfinite(pd.NA)`` returns pd.NA and ``if`` then
+    # raises "boolean value of NA is ambiguous".
+    beneish = (
+        pd.to_numeric(frame.get("beneish_m_score", pd.Series(np.nan, index=frame.index)), errors="coerce").astype(
+            "float64"
+        )
+    )
+    fscore = (
+        pd.to_numeric(frame.get("piotroski_f_score", pd.Series(np.nan, index=frame.index)), errors="coerce").astype(
+            "float64"
+        )
+    )
 
     # Per-sector risk index (same cross-section the endogenous cutoff was learned on).
     risk_by_key: dict[str, pd.Series] = {}

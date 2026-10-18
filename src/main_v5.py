@@ -24,6 +24,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -450,4 +451,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Batch entrypoint: always terminate. A stalled Hub transfer can leave
+    # non-daemon native threads alive (hf_xet) and Python's interpreter shutdown
+    # waits on them forever — in CI the step would run until the job timeout and
+    # no artifacts would upload. Every output is written and flushed before
+    # ``main`` returns, so a hard exit here is safe and keeps the exit code.
+    _rc = int(main())
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_rc)

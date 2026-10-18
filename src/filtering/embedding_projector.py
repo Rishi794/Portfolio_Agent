@@ -476,11 +476,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = Config.load()
-    client = HttpClient(
-        cache_dir=Path.home() / ".cache" / "pms_http",
-        offline=args.offline,
-        headers={"Accept": "application/json, application/rss+xml, text/xml, */*"},
-    )
+    # GDELT requires its own pacing; every other domain keeps the shared defaults.
+    if args.ingest_domain == "geopol_gdelt":
+        from ..ingestion.geopolitics_gdelt import make_client
+
+        client = make_client(config, cache_dir=Path.home() / ".cache" / "pms_http", offline=args.offline)
+    else:
+        client = HttpClient(
+            cache_dir=Path.home() / ".cache" / "pms_http",
+            offline=args.offline,
+            headers={"Accept": "application/json, application/rss+xml, text/xml, */*"},
+        )
     projector = EventProjector(config) if not args.backend else EventProjector(
         config, backend=get_backend(args.backend)
     )

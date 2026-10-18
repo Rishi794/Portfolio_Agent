@@ -232,3 +232,42 @@ def test_empty_universe_returns_the_empty_contract() -> None:
     result = engine.forecast_universe_cross_section({}, market="US")
     assert result.empty
     assert list(result.columns) == list(OUTPUT_COLUMNS)
+
+
+def test_stalled_checkpoint_load_degrades_instead_of_hanging(monkeypatch) -> None:
+    """A cold/stalled Hub download must hit the deadline, not the job timeout."""
+    import time
+
+    import src.filtering.timestral_forecaster as tf
+
+    if not tf.TIMESTRAL_AVAILABLE:
+        pytest.skip("timestral extra not installed")
+
+    class _StalledForecaster:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):  # noqa: ANN002, ANN003 - signature mirror
+            time.sleep(5.0)
+            raise AssertionError("a stalled download must not be awaited past the deadline")
+
+    monkeypatch.setattr(tf, "TimestralForecaster", _StalledForecaster)
+    # The suite-wide conftest forces the offline path; this test exercises the
+    # (normally lazy) checkpoint loader itself.
+    monkeypatch.delenv("PMS_TIMESTRAL_DISABLED", raising=False)
+    engine = TimestralForecastEngine(
+        _StubConfig(
+            {
+                "aladdin.timestral.load_timeout_seconds": 0.3,
+                "aladdin.timestral.prediction_length": 5,
+            }
+        )
+    )
+
+    started = time.monotonic()
+    result = engine.forecast_universe_cross_section({"T.NS": _panel("T.NS", seed=50)}, market="INDIA")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0, "the load deadline must cut the wait short"
+    assert engine.mode == "offline_fallback"
+    assert "TimeoutError" in (engine.load_error or "")
+    assert len(result) == 1
+    assert np.isfinite(result.to_numpy(dtype=float)).all()

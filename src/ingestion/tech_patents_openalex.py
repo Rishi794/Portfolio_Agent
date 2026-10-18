@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import time
 from pathlib import Path
 from typing import Any
 
@@ -159,25 +160,55 @@ class PatentAndTechEvolutionIngestor:
         }
 
     # --------------------------------------------------------------- universe ---
-    def fetch_universe(self, *, limit: int | None = None, symbols: list[str] | None = None) -> pd.DataFrame:
-        rows: list[dict[str, Any]] = []
+    def fetch_universe(
+        self,
+        *,
+        limit: int | None = None,
+        symbols: list[str] | None = None,
+        shard_id: int = 0,
+        total_shards: int = 1,
+        max_seconds: float | None = None,
+    ) -> pd.DataFrame:
+        """Crawl OpenAlex/PatentsView for this shard of the universe.
+
+        The shard is selected **before** any network call: each parallel weekly
+        shard fetches only its slice, and a slow/throttled runner cannot burn the
+        whole job budget re-crawling 5× the same companies. ``max_seconds`` is a
+        cooperative deadline — when exceeded the crawl stops and returns what it
+        has, so the step always writes a (partial) shard instead of being killed
+        by the job timeout with nothing to upload.
+        """
+        items: list[tuple[str, str, str]] = []
         loader = UniverseLoader(self.config, self.client)
         for market in self.config.markets():
             if symbols:
-                items = [{"ticker": symbol, "name": symbol} for symbol in symbols]
+                items.extend((market, symbol, symbol) for symbol in symbols)
             else:
                 try:
                     universe = loader.load(market, limit=limit)
                 except Exception:
                     continue
-                items = universe.to_dict("records")
-            for item in items:
-                ticker = str(item.get("ticker"))
-                name = str(item.get("name") or ticker.replace(".NS", ""))
-                try:
-                    rows.append(self.fetch_company_tech_velocity(ticker, name, market))
-                except Exception:
-                    continue
+                for item in universe.to_dict("records"):
+                    ticker = str(item.get("ticker"))
+                    name = str(item.get("name") or ticker.replace(".NS", ""))
+                    items.append((market, ticker, name))
+        selected = shard_of(list(range(len(items))), shard_id, total_shards)
+        deadline = (time.monotonic() + max_seconds) if max_seconds else None
+        rows: list[dict[str, Any]] = []
+        for position, index in enumerate(selected):
+            if deadline is not None and time.monotonic() >= deadline:
+                print(
+                    f"[tech] time budget reached after {position}/{len(selected)} companies; "
+                    f"writing partial shard (warm caches make the remainder cheap on the next run)"
+                )
+                break
+            market, ticker, name = items[index]
+            try:
+                rows.append(self.fetch_company_tech_velocity(ticker, name, market))
+            except Exception:
+                continue
+            if (position + 1) % 50 == 0:
+                print(f"[tech] crawled {position + 1}/{len(selected)} companies", flush=True)
         return pd.DataFrame(rows)
 
     def enrich_with_fundamentals(self, tech: pd.DataFrame, fundamentals: pd.DataFrame) -> pd.DataFrame:
@@ -203,6 +234,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--shard-id", type=int, default=0)
     parser.add_argument("--total-shards", type=int, default=1)
+    parser.add_argument(
+        "--max-minutes",
+        type=float,
+        default=20.0,
+        help="Cooperative crawl deadline; the step writes a partial shard instead of being job-killed",
+    )
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args(argv)
 
@@ -212,20 +249,30 @@ def main(argv: list[str] | None = None) -> int:
     client = HttpClient(
         headers=OPENALEX_HEADERS,
         cache_dir=Path.home() / ".cache" / "pms_openalex",
+        # Citation/patent velocity is a slow-moving weekly-cadence pillar (see the
+        # weekly deep-sync workflow): a 7-day cache TTL lets the daily run reuse the
+        # deep sync's warmed cache instead of re-crawling thousands of endpoints.
+        cache_ttl_seconds=7 * 86_400.0,
         offline=args.offline,
     )
     client.headers.update(OPENALEX_HEADERS)
     ingestor = PatentAndTechEvolutionIngestor(
         config, client, patentsview_api_key=os.getenv("PATENTSVIEW_API_KEY", "")
     )
-    frame = ingestor.fetch_universe(limit=args.limit)
-    if not frame.empty:
-        frame = frame.iloc[shard_of(list(range(len(frame))), args.shard_id, args.total_shards)]
+    frame = ingestor.fetch_universe(
+        limit=args.limit,
+        shard_id=args.shard_id,
+        total_shards=args.total_shards,
+        max_seconds=(args.max_minutes * 60.0) if args.max_minutes and args.max_minutes > 0 else None,
+    )
     if args.data_dir and not frame.empty:
         fundamentals_path = Path(args.data_dir) / "fundamentals_pit.parquet"
         if fundamentals_path.exists():
             frame = ingestor.enrich_with_fundamentals(frame, pd.read_parquet(fundamentals_path))
-    path = write_shard(frame, args.output_dir, "tech_patents_velocity")
+    # Distinct file name per shard: the weekly workflow reuses one output directory
+    # across the 5 shard invocations, and a fixed name would keep only the last one.
+    name = "tech_patents_velocity" if args.total_shards <= 1 else f"tech_patents_velocity_{args.shard_id}"
+    path = write_shard(frame, args.output_dir, name)
     print(f"wrote {len(frame)} technology rows -> {path}")
     return 0
 

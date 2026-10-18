@@ -132,6 +132,29 @@ def _parse_seendate(value: str | None) -> dt.datetime | None:
     return None
 
 
+def make_client(
+    config: Config,
+    *,
+    cache_dir: str | Path | None = None,
+    offline: bool = False,
+) -> HttpClient:
+    """Pacing-aware client for the GDELT Doc API (one call per documented interval).
+
+    GDELT answers bursts with an HTTP 429 whose body is a *plain-text* notice;
+    unless every caller of this endpoint shares the same pacing + retry floor the
+    whole geopolitics pillar degrades on the first burst. Used by this module's CLI
+    and by ``src.filtering.embedding_projector --ingest-domain geopol_gdelt``.
+    """
+    geopolitics = dict(config.get("universe.event_sources.geopolitics", {}) or {})
+    interval = float(geopolitics.get("min_interval_seconds", 5.0) or 0.0)
+    return HttpClient(
+        cache_dir=cache_dir,
+        offline=offline,
+        min_interval=interval,
+        retry_after_floor=interval,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GDELT geopolitical ingestion")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -142,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = Config.load()
-    client = HttpClient(cache_dir=Path.home() / ".cache" / "pms_http", offline=args.offline)
+    client = make_client(config, cache_dir=Path.home() / ".cache" / "pms_http", offline=args.offline)
     frame = GeopoliticsIngestor(config, client).fetch(
         max_records=args.max_records, timespan=args.timespan, include_sanctions=args.include_sanctions
     )

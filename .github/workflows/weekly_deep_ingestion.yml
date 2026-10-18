@@ -80,6 +80,10 @@ jobs:
           if-no-files-found: warn
 
   deep-tech-shards:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -100,19 +104,21 @@ jobs:
           key: pms-deep-tech-${{ github.run_id }}
           restore-keys: pms-deep-tech-
 
-      - name: Patents / publications / R&D velocity
+      - name: Patents / publications / R&D velocity (shard ${{ matrix.shard }}/5)
         env:
           PATENTSVIEW_API_KEY: ${{ secrets.PATENTSVIEW_API_KEY }}
         run: |
-          for shard in 0 1 2 3 4; do
-            uv run python -m src.ingestion.tech_patents_openalex \
-              --output-dir shards --limit 500 \
-              --shard-id "$shard" --total-shards 5 || true
-          done
+          # Universe sharding happens BEFORE the crawl, so this job fetches only
+          # its ~1/5 slice; each shard writes its own file (tech_patents_velocity_<id>)
+          # and a crawl budget bounds the whole step.
+          uv run python -m src.ingestion.tech_patents_openalex \
+            --output-dir shards --limit 500 \
+            --shard-id ${{ matrix.shard }} --total-shards 5 \
+            --max-minutes 20 || true
 
       - uses: actions/upload-artifact@v7
         with:
-          name: deep-tech
+          name: deep-tech-${{ matrix.shard }}
           path: shards/
           retention-days: 5
           if-no-files-found: warn
