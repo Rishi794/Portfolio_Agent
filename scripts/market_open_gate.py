@@ -106,7 +106,7 @@ def main() -> int:
     # `fromJSON` input for the shard matrix. It must never be empty (GitHub rejects
     # an empty matrix), and it doubles as the run filter because the `matrix`
     # context is unavailable in a job-level `if`: when nothing is open, the
-    # `run` output is false and the dependent jobs are skipped entirely.
+    # `run` output is false and the data-ingestion / fan-in jobs are skipped.
     _emit("market_matrix", json.dumps(open_markets or candidates))
     _emit("markets", ",".join(open_markets))
     _emit("run", "true" if open_markets else "false")

@@ -88,10 +88,9 @@ jobs:
           echo "run_label=${MODE}-${{ steps.gate.outputs.markets }}-$(date -u +%Y%m%dT%H%MZ)" >> "$GITHUB_OUTPUT"
           echo "mode=$MODE markets=${{ steps.gate.outputs.markets }} run=${{ steps.gate.outputs.run }}"
 
-  # ------------------------------------------- stage 0.5 (formal proof gate) --
+  # --------------------------------------------- stage 0.5 (CI quality gate) --
   verify-invariants:
     needs: prepare
-    if: needs.prepare.outputs.run_pipeline == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -105,8 +104,12 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra onnx --extra dev
 
-      - name: Formal Open-Aladdin invariant gate (quorum, IBOR, Euler, Löwdin, ADV)
-        run: uv run pytest tests/test_aladdin_invariants.py -v
+      # Always run the offline regression suite, including on holidays and the
+      # unused US DST schedule slot. Market ingestion remains gated below, but a
+      # scheduled workflow should still validate the code instead of ending after
+      # the short prepare job with every downstream job skipped.
+      - name: Offline regression suite + Open-Aladdin invariant gate
+        run: uv run pytest -q
 
   # ------------------------------------------------------------------ stage 1A --
   company-shards:
