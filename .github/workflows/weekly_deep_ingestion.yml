@@ -147,13 +147,13 @@ jobs:
 
       # The weekly fan-in publishes the same 7th pillar as the daily path, so it mounts
       # the same Stage-3 checkpoint cache (stable key -> warmed once, no re-upload).
-      - name: Cache ONNX BGE + Mistral Timestral-209M (weekly fan-in)
+      - name: Cache ONNX BGE + Mistral Timestral-5M (weekly fan-in)
         uses: actions/cache@v6
         with:
           path: |
             ~/.cache/onnx_models
             ~/.cache/huggingface
-          key: pms-stage3-models-bge-timestral-209m-v1
+          key: pms-stage3-models-bge-timestral-5m-v1
           restore-keys: pms-stage3-models-
 
       - uses: astral-sh/setup-uv@v10.3.0

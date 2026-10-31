@@ -129,8 +129,8 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # Stage-2A shards deliberately DO NOT install the `timestral` extra: the 837 MB
-      # Timestral-209M checkpoint is mounted once in the fan-in job instead of ten times.
+      # Stage-2A shards deliberately DO NOT install the `timestral` extra: the model
+      # checkpoint is mounted once in the fan-in job instead of ten times.
       - name: Install dependencies
         run: uv sync --extra onnx --extra dev
 
@@ -278,17 +278,17 @@ jobs:
           restore-keys: pms-lake-${{ github.ref_name }}-
 
       # Stage-3 model cache: the ONNX BGE encoder (33 MB, used by --backend onnx) and
-      # the Timestral-209M checkpoint (837 MB) are restored ONCE here instead of being
+      # the Timestral checkpoint is restored ONCE here instead of being
       # re-downloaded by every fan-in run. The key is STABLE (not per-run) so a warm
       # cache is an exact hit with no re-upload — GitHub's 10 GB repo quota cannot be
-      # thrashed by ~870 MB daily entries. Bump the -v1 suffix when changing model_id.
-      - name: Cache ONNX BGE + Mistral Timestral-209M (fan-in only)
+      # thrashed by daily entries. Bump the suffix when changing cache layout.
+      - name: Cache ONNX BGE + Mistral Timestral-5M (fan-in only)
         uses: actions/cache@v6
         with:
           path: |
             ~/.cache/onnx_models
             ~/.cache/huggingface
-          key: pms-stage3-models-bge-timestral-209m-v1
+          key: pms-stage3-models-bge-timestral-5m-v1
           restore-keys: pms-stage3-models-
 
       - uses: astral-sh/setup-uv@v10.3.0

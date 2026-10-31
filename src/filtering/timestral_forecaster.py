@@ -1,7 +1,7 @@
 """Mistral **Timestral** zero-shot probabilistic forecaster — the Stage-3 7th pillar.
 
-Wraps ``mistralai/Timestral-209M`` (209M params, 24 layers, d_model 768, 32-step
-patches; 837 MB fp32) through the official ``timestral`` inference package
+Wraps the configured Timestral checkpoint (default ``mistralai/Timestral-5M``)
+through the official ``timestral`` inference package
 (``pip install git+https://github.com/mistralai/timestral.git``, Apache-2.0 code /
 Modified-MIT weights).
 
@@ -10,9 +10,8 @@ Why the *multivariate* call and not a per-stock loop
 Timestral has two attention stacks: **time attention** and **variate attention**.
 Forecasting one stock at a time (``V = 1``) disables the variate stack entirely;
 packing the surviving cross-section **plus macro/spillover drivers** into a single
-``(B, V, T)`` context lets the 24 variate-attention layers price cross-stock,
-sector and macro-to-stock lead-lag structure in one forward pass. The same trick
-collapses N sequential 140 ms passes into one batched pass.
+``(B, V, T)`` context lets the variate-attention stack price cross-stock,
+keeps cross-series context available during the forecast.
 
 Point-in-time discipline
 ------------------------
@@ -21,7 +20,8 @@ OHLCV (knowledge timestamp <= as_of, trade_date <= as_of). The only forward-look
 inputs are:
 
 * **known-future calendar covariates** — exchange rules (derivative expiry,
-  month-end rebalancing) and *announced* corporate-action ex-dates; and
+  month-end rebalancing), *announced* corporate-action ex-dates, and optional
+  caller-supplied scheduled event dates; and
 * the model's own forecast.
 
 Artificially lagging the calendar is not required (expiry schedules are public
@@ -54,6 +54,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+
+from .kalman_smoother import AdaptiveKalmanFilter
 
 try:  # pragma: no cover - the Stage-3 extra is only installed in the fan-in job
     import torch
@@ -114,7 +116,7 @@ class TimestralForecastEngine:
     Hub. If the ``timestral`` package is absent, or the checkpoint cannot be
     loaded, the engine degrades to a deterministic empirical-quantile fallback and
     reports ``mode == "offline_fallback"`` — the pipeline never hard-fails on a
-    missing 837 MB artifact.
+    missing checkpoint.
     """
 
     def __init__(
@@ -129,7 +131,7 @@ class TimestralForecastEngine:
         forecaster: Any = None,
     ) -> None:
         self.config = config
-        self.model_id = str(model_id or _cfg(config, "timestral.model_id", "mistralai/Timestral-209M"))
+        self.model_id = str(model_id or _cfg(config, "timestral.model_id", "mistralai/Timestral-5M"))
         self.device = device or str(_cfg(config, "timestral.device", "auto"))
         self.cache_dir = str(
             Path(str(cache_dir or _cfg(config, "timestral.cache_dir", "~/.cache/huggingface"))).expanduser()
@@ -245,6 +247,7 @@ class TimestralForecastEngine:
         prediction_length: int,
         market: str,
         ex_dates_union: set[dt.date] | None = None,
+        event_dates: Mapping[str, set[dt.date]] | None = None,
     ) -> np.ndarray:
         """Binary known-future rows over ``T_context + H``: expiry / ex-date / month-end.
 
@@ -256,7 +259,8 @@ class TimestralForecastEngine:
         future = pd.bdate_range(start=last + pd.Timedelta(days=1), periods=int(prediction_length))
         full = pd.DatetimeIndex(history_dates).append(future)
 
-        covariates = np.zeros((3, len(full)), dtype=np.float32)
+        event_dates = event_dates or {}
+        covariates = np.zeros((3 + len(event_dates), len(full)), dtype=np.float32)
         for index, timestamp in enumerate(full):
             day = timestamp.date()
             if market == "INDIA":
@@ -268,6 +272,8 @@ class TimestralForecastEngine:
             covariates[0, index] = 1.0 if is_expiry else 0.0
             covariates[1, index] = 1.0 if day in ex_set else 0.0
             covariates[2, index] = 1.0 if (day + dt.timedelta(days=3)).month != day.month else 0.0
+            for row, dates in enumerate(event_dates.values(), start=3):
+                covariates[row, index] = 1.0 if day in dates else 0.0
         return covariates
 
     # ---------------------------------------------------------------- scoring --
@@ -345,6 +351,7 @@ class TimestralForecastEngine:
         sectors: pd.Series | None = None,
         ex_dates_by_ticker: Mapping[str, set[dt.date]] | None = None,
         macro_frame: pd.DataFrame | None = None,
+        known_event_dates: Mapping[str, set[dt.date]] | None = None,
         prediction_length: int | None = None,
     ) -> pd.DataFrame:
         """Joint ``(B=1, V, T)`` forecast for the whole candidate cross-section.
@@ -363,6 +370,8 @@ class TimestralForecastEngine:
         vol_floor = float(_cfg(self.config, "timestral.vol_floor", 1e-6))
         use_sectors = bool(_cfg(self.config, "timestral.use_sector_covariate", True))
         ex_map = ex_dates_by_ticker or {}
+        known_event_dates = known_event_dates or {}
+        kalman = AdaptiveKalmanFilter() if self.config is None else AdaptiveKalmanFilter.from_config(self.config)
 
         prepared: list[dict[str, Any]] = []
         for ticker, group in ohlcv_groups.items():
@@ -390,6 +399,18 @@ class TimestralForecastEngine:
                 np.maximum(volumes.to_numpy(dtype=np.float64), 1.0) / np.maximum(average_volume, 1.0)
             )
 
+            # History-only covariates: normalized Kalman local-trend velocity and
+            # Corwin-Schultz high/low spread proxy. Missing OHLC fields safely map to 0.
+            kalman_velocity = np.asarray(kalman.filter(closes)["velocity"], dtype=np.float64)
+            if kalman_velocity.size != log_returns.size:
+                kalman_velocity = log_returns.copy()
+            kalman_velocity = np.nan_to_num(kalman_velocity / max(daily_vol, vol_floor))
+            highs = pd.to_numeric(frame.get("high", pd.Series(np.nan, index=frame.index)), errors="coerce")
+            lows = pd.to_numeric(frame.get("low", pd.Series(np.nan, index=frame.index)), errors="coerce")
+            high_values = highs.to_numpy(dtype=np.float64)
+            low_values = lows.to_numpy(dtype=np.float64)
+            spread = self._corwin_schultz_series(high_values, low_values)
+
             liquidity = float(
                 np.nanmean(
                     pd.to_numeric(frame.get("dollar_volume", pd.Series(np.nan, index=frame.index)), errors="coerce")
@@ -403,6 +424,8 @@ class TimestralForecastEngine:
                     "dates": dates,
                     "target": (log_returns / daily_vol).astype(np.float32),
                     "past": np.nan_to_num(abnormal, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32),
+                    "kalman_velocity": kalman_velocity.astype(np.float32),
+                    "spread": spread.astype(np.float32),
                     "vol": daily_vol,
                     "liquidity": liquidity if np.isfinite(liquidity) else 0.0,
                 }
@@ -411,9 +434,8 @@ class TimestralForecastEngine:
         if not prepared:
             return pd.DataFrame(columns=list(OUTPUT_COLUMNS), index=pd.Index([], name="ticker"))
 
-        # Cap the variate count by liquidity: 24-layer variate attention over 128
-        # names is the CPU sweet spot; the tail of the cross-section adds little
-        # and costs quadratically.
+        # Cap the number of stock names by liquidity; the model also receives a
+        # volume variate for each retained stock plus macro/breadth context.
         prepared.sort(key=lambda item: item["liquidity"], reverse=True)
         prepared = prepared[:max_variates]
 
@@ -422,17 +444,31 @@ class TimestralForecastEngine:
         target_panel = pd.DataFrame(
             {item["ticker"]: pd.Series(item["target"], index=item["dates"]) for item in prepared}
         ).reindex(index)
-        past_panel = pd.DataFrame(
+        volume_target_panel = pd.DataFrame(
             {item["ticker"]: pd.Series(item["past"], index=item["dates"]) for item in prepared}
         ).reindex(index)
+        past_blocks = []
+        for feature in ("past", "kalman_velocity", "spread"):
+            past_blocks.append(pd.DataFrame(
+                {f"{item['ticker']}::{feature}": pd.Series(item[feature], index=item["dates"]) for item in prepared}
+            ).reindex(index))
+        past_panel = pd.concat(past_blocks, axis=1)
+        if macro_frame is not None and not macro_frame.empty:
+            macro_covariates = macro_frame.reindex(index).ffill()
+            macro_covariates = macro_covariates.loc[:, macro_covariates.notna().any(axis=0)]
+            if not macro_covariates.empty:
+                past_panel = pd.concat([past_panel, macro_covariates.add_prefix("macro::")], axis=1)
+        past_panel = past_panel.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-        variate_blocks = [target_panel]
+        # Both targets are stationary: standardized log return and log abnormal volume.
+        # Stock return variates stay first because result rows are scored by this index.
+        variate_blocks = [target_panel, volume_target_panel.add_prefix("volume::")]
         if macro_frame is not None and not macro_frame.empty:
             macro = macro_frame.reindex(index).ffill()
             macro = macro.loc[:, macro.notna().any(axis=0)]
             if not macro.empty:
                 variate_blocks.append(macro.astype(np.float32))
-        if len(variate_blocks) == 1:
+        if macro_frame is None or macro_frame.empty:
             variate_blocks.append(target_panel.mean(axis=1).rename("__MKT_BREADTH__").to_frame().astype(np.float32))
             variate_blocks.append(
                 target_panel.std(axis=1).fillna(0.0).rename("__MKT_DISPERSION__").to_frame().astype(np.float32)
@@ -449,15 +485,24 @@ class TimestralForecastEngine:
         for ticker_dates in ex_map.values():
             ex_dates_union.update(ticker_dates)
         known = np.ascontiguousarray(
-            self.build_known_future_calendar(history, horizon, market, ex_dates_union)[None, ...]
+            self.build_known_future_calendar(
+                history, horizon, market, ex_dates_union, known_event_dates
+            )[None, ...]
         )
 
         categorical: np.ndarray | None = None
-        if use_sectors and sectors is not None and not sectors.empty:
-            sector_values = sectors.reindex(target_panel.columns).astype("object")
-            codes, _ = pd.factorize(sector_values, sort=True, use_na_sentinel=True)
-            codes = np.where(codes < 0, np.nan, codes).astype(np.float32)
-            category_rows = np.repeat(codes[:, None], context.shape[-1] + horizon, axis=1)
+        if use_sectors:
+            if sectors is not None and not sectors.empty:
+                sector_values = sectors.reindex(target_panel.columns).astype("object")
+                codes, _ = pd.factorize(sector_values, sort=True, use_na_sentinel=True)
+                codes = np.where(codes < 0, np.nan, codes).astype(np.float32)
+            else:
+                codes = np.full(len(target_panel.columns), np.nan, dtype=np.float32)
+            exchange_code = 0.0 if market == "INDIA" else 1.0
+            exchange_codes = np.full(codes.shape, exchange_code, dtype=np.float32)
+            category_rows = np.repeat(
+                np.concatenate([codes, exchange_codes])[:, None], context.shape[-1] + horizon, axis=1
+            )
             categorical = np.ascontiguousarray(category_rows[None, ...])  # (B=1, C_cat=V_stocks, T+H)
 
         self._ensure_forecaster()
@@ -481,6 +526,26 @@ class TimestralForecastEngine:
             metrics = self.score_quantiles(quantiles[position], item["vol"])
             rows.append({"ticker": item["ticker"], **metrics})
         return pd.DataFrame(rows).set_index("ticker")
+
+    @staticmethod
+    def _corwin_schultz_series(high: np.ndarray, low: np.ndarray) -> np.ndarray:
+        """Causal daily Corwin-Schultz spread proxy from current and prior OHLC bars."""
+        high = np.asarray(high, dtype=np.float64)
+        low = np.asarray(low, dtype=np.float64)
+        values = np.zeros(high.size, dtype=np.float64)
+        if high.size < 2:
+            return values
+        valid = np.isfinite(high) & np.isfinite(low) & (high > 0) & (low > 0)
+        for i in range(1, high.size):
+            if not (valid[i] and valid[i - 1]):
+                continue
+            beta = np.log(high[i] / low[i]) ** 2 + np.log(high[i - 1] / low[i - 1]) ** 2
+            gamma = np.log(max(high[i], high[i - 1]) / min(low[i], low[i - 1])) ** 2
+            denom = 3.0 - 2.0 * np.sqrt(2.0)
+            alpha = (np.sqrt(2.0 * beta) - np.sqrt(beta)) / denom - np.sqrt(max(gamma / denom, 0.0))
+            exp_alpha = np.exp(np.clip(alpha, -50.0, 50.0))
+            values[i] = max(0.0, 2.0 * (exp_alpha - 1.0) / (1.0 + exp_alpha))
+        return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _call_model(
         self,

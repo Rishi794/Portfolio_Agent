@@ -79,17 +79,18 @@ proxy_factors:
 
 # -----------------------------------------------------------------------------
 # Stage-3 7th pillar: Mistral Timestral zero-shot probabilistic forecaster
-# (``mistralai/Timestral-209M``). Code: Apache-2.0; weights: Modified MIT (free for
-# organisations under $20M consolidated monthly revenue). The 837 MB checkpoint is
-# mounted ONLY in the fan-in job (see .github/workflows/parallel_dag_pipeline.yml);
+# (default ``mistralai/Timestral-5M``; override with another supported checkpoint).
+# Code: Apache-2.0; weights: Modified MIT (free for organisations under $20M
+# consolidated monthly revenue). The small checkpoint is mounted ONLY in the
+# fan-in job (see .github/workflows/parallel_dag_pipeline.yml);
 # everywhere else the engine degrades to its deterministic empirical fallback and
 # reports ``mode = offline_fallback`` in the run diagnostics.
 # -----------------------------------------------------------------------------
 timestral:
   # Master switch: ``false`` reproduces the V4 six-pillar factor mix byte-for-byte.
   enabled: true
-  # 209M params / 837 MB fp32, 24 layers, d_model 768, 32-step patches.
-  model_id: mistralai/Timestral-209M
+  # CPU-friendly 5M checkpoint (~21 MB); Timestral-209M remains selectable here.
+  model_id: mistralai/Timestral-5M
   # Forecast horizon in trading days (one week). Distinct from the IC-IR horizon.
   prediction_length: 5
   # Context length fed to the patch transformer (256 = eight 32-step patches).
