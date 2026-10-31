@@ -95,6 +95,17 @@ def _cfg(config: Any, path: str, default: Any) -> Any:
     return config.get(f"aladdin.{path}", default)
 
 
+def _to_numpy(value: Any) -> np.ndarray:
+    """Convert NumPy arrays and CPU/GPU torch tensors into a host NumPy view/copy."""
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value, dtype=np.float64)
+
+
 class TimestralForecastEngine:
     """Multivariate, covariate-conditioned Timestral forecaster.
 
@@ -166,15 +177,17 @@ class TimestralForecastEngine:
                 raise RuntimeError(self._load_error)
             return
         try:
-            if str(self.device) == "cpu" or str(_cfg(self.config, "timestral.device", "auto")) == "cpu":
-                torch.set_num_threads(int(self.threads or os.cpu_count() or 4))
+            self.device = self.resolve_device(self.device, torch)
+            if self.device == "cpu":
+                thread_count = int(self.threads or os.cpu_count() or 4)
+                if thread_count < 1:
+                    raise ValueError("timestral.cpu_threads must be positive")
+                torch.set_num_threads(thread_count)
                 try:
                     torch.set_float32_matmul_precision("high")
                 except Exception:  # pragma: no cover - older torch builds
                     pass
-            kwargs: dict[str, Any] = {"cache_dir": self.cache_dir or None}
-            if str(self.device) not in {"auto", ""}:
-                kwargs["device"] = self.device
+            kwargs: dict[str, Any] = {"cache_dir": self.cache_dir or None, "device": self.device}
             if self.local_files_only:
                 kwargs["local_files_only"] = True
             self._forecaster = self._load_with_timeout(kwargs)
@@ -183,6 +196,15 @@ class TimestralForecastEngine:
             if self.require_model:
                 raise
             self._forecaster = None
+
+    @staticmethod
+    def resolve_device(requested: str, torch_module: Any) -> str:
+        """Resolve ``auto`` explicitly so CPU runners also receive CPU tuning."""
+        normalized = str(requested or "auto").strip().lower()
+        if normalized not in {"", "auto"}:
+            return normalized
+        cuda_available = getattr(getattr(torch_module, "cuda", None), "is_available", None)
+        return "cuda" if callable(cuda_available) and cuda_available() else "cpu"
 
     def _load_with_timeout(self, kwargs: dict[str, Any]) -> Any:
         """Load the checkpoint with a hard deadline (``timestral.load_timeout_seconds``).
@@ -293,7 +315,7 @@ class TimestralForecastEngine:
         """Normalise the upstream ``Forecast`` into a ``(V, H, 21)`` float64 array."""
         quantiles = getattr(forecast, "quantiles", None)
         if quantiles is not None:
-            array = np.asarray(quantiles.detach() if hasattr(quantiles, "detach") else quantiles, dtype=np.float64)
+            array = _to_numpy(quantiles)
             if array.ndim == 4:  # (B, V, H, Q)
                 return array[0, :, :horizon, :]
             if array.ndim == 3:  # (V, H, Q) already unbatched
@@ -302,7 +324,7 @@ class TimestralForecastEngine:
             slices = []
             for level in TIMESTRAL_QUANTILES:
                 values = forecast.quantile(float(level))
-                values = np.asarray(values.detach() if hasattr(values, "detach") else values, dtype=np.float64)
+                values = _to_numpy(values)
                 if values.ndim == 3:
                     values = values[0]
                 elif values.ndim == 1:
@@ -432,11 +454,11 @@ class TimestralForecastEngine:
 
         categorical: np.ndarray | None = None
         if use_sectors and sectors is not None and not sectors.empty:
-            codes, _ = pd.factorize(sectors.reindex(target_panel.columns).astype("object"), use_na_sentinel=True)
-            row = np.where(codes < 0, np.nan, codes).astype(np.float32)[:, None]
-            categorical = np.ascontiguousarray(
-                np.repeat(row, context.shape[-1], axis=1).T[None, ...]
-            )  # (B=1, C_cat=1, T)
+            sector_values = sectors.reindex(target_panel.columns).astype("object")
+            codes, _ = pd.factorize(sector_values, sort=True, use_na_sentinel=True)
+            codes = np.where(codes < 0, np.nan, codes).astype(np.float32)
+            category_rows = np.repeat(codes[:, None], context.shape[-1] + horizon, axis=1)
+            categorical = np.ascontiguousarray(category_rows[None, ...])  # (B=1, C_cat=V_stocks, T+H)
 
         self._ensure_forecaster()
         quantiles: np.ndarray | None = None
@@ -474,7 +496,7 @@ class TimestralForecastEngine:
             "known_covariates": known,
         }
         if categorical is not None:
-            kwargs["categorical_past_covariates"] = categorical
+            kwargs["categorical_known_covariates"] = categorical
         if torch is not None and hasattr(torch, "inference_mode"):  # pragma: no cover - real torch path
             with torch.inference_mode():
                 forecast = self._forecaster.forecast(context, **kwargs)

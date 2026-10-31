@@ -159,17 +159,40 @@ def test_joint_multivariate_forward_pass_includes_macro_variates() -> None:
         forecaster=stub,
     )
 
-    result = engine.forecast_universe_cross_section(groups, market="INDIA", macro_frame=macros)
+    sectors = pd.Series({f"T{i}.NS": f"SECTOR_{i % 3}" for i in range(6)})
+    result = engine.forecast_universe_cross_section(
+        groups, market="INDIA", macro_frame=macros, sectors=sectors
+    )
 
     assert len(stub.calls) == 1, "the cross-section must be one joint (B=1, V, T) pass"
     call = stub.calls[0]
     assert call["context"].shape == (1, 6 + 2, 140)
     assert call["past_covariates"].shape == (1, 6, 140)
     assert call["known_covariates"].shape == (1, 3, 140 + 5)
+    assert call["categorical_known_covariates"].shape == (1, 6, 140 + 5)
+    assert "categorical_past_covariates" not in call
     assert engine.mode == "model"
     assert sorted(result.index) == sorted(groups)
     assert list(result.columns) == list(OUTPUT_COLUMNS)
     assert np.isfinite(result["f_timestral"]).all()
+
+
+def test_auto_device_resolves_cpu_and_cuda_and_explicit_choice_wins() -> None:
+    class _CpuTorch:
+        class cuda:
+            @staticmethod
+            def is_available():
+                return False
+
+    class _CudaTorch:
+        class cuda:
+            @staticmethod
+            def is_available():
+                return True
+
+    assert TimestralForecastEngine.resolve_device("auto", _CpuTorch) == "cpu"
+    assert TimestralForecastEngine.resolve_device("auto", _CudaTorch) == "cuda"
+    assert TimestralForecastEngine.resolve_device("cpu", _CudaTorch) == "cpu"
 
 
 def test_macro_free_call_synthesises_breadth_and_dispersion_variates() -> None:

@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 
 from .config import Config
+from .flex_model.aladdin_features import flex as aladdin_flex
+from .flex_model.engine import EventKind
 from .main_v4 import V4AutonomousPortfolioReducer, _jsonable, _resolve_markets
 from .state.ledger import Ledger
 from .verification.aladdin_golden_copy_and_risk import (
@@ -416,7 +418,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     pipeline = V5OpenAladdinPipeline(reducer, config)
     pipeline.ingest_golden_shards()
+    # Compile the event-oriented feature plans at startup, with market pruning.
+    # The current reducer consumes batch lakehouse snapshots; these plans expose
+    # the streaming feature runtime without silently replacing its production
+    # batch factors until event-state persistence and replay are wired end to end.
+    flex_model = {
+        "runtime": "compiled_reference_plans",
+        "plans": {
+            market: {
+                event.name: aladdin_flex.compile_plan(market, event).describe_plan()
+                for event in EventKind
+            }
+            for market in markets
+        },
+    }
     summary = reducer.run(markets, mode=mode)
+    summary["flex_model"] = flex_model
     telemetry = pipeline.process(summary)
 
     if args.output_issue:
