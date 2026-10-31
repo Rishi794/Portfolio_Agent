@@ -54,6 +54,13 @@ The three hard problems the architecture solves explicitly:
    `F⊥ = F·C_F^(−1/2)`, which decorrelates while minimizing `‖F⊥ − F‖_F` (keeps the
    economic interpretation of each pillar, unlike PCA rotation).
 
+V5 also replays PIT OHLCV and fact snapshots through the compiled Flex event plans.
+The per-market arena is checkpointed on the `data-state` branch; unchanged history
+resumes from its last bar, while a historical price/action correction forces replay.
+Flex velocity, fundamental, patent, policy, and India spillover outputs are blended
+into their corresponding batch pillars before Löwdin orthogonalization and IC-IR
+weight learning. Its rolling spread estimate penalizes the trend input.
+
 ### The Stage-3 Timestral pillar (7th domain)
 
 `src/filtering/timestral_forecaster.py` wraps Mistral's **Timestral** forecasting

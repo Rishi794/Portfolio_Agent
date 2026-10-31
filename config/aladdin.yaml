@@ -86,8 +86,15 @@ proxy_factors:
 # everywhere else the engine degrades to its deterministic empirical fallback and
 # reports ``mode = offline_fallback`` in the run diagnostics.
 # -----------------------------------------------------------------------------
+flex_model:
+  enabled: true
+  # Blend the streaming event features into the established batch factor pillars.
+  blend_weight: 0.25
+  # Deduct a bounded standardized spread cost from the trend feature.
+  spread_penalty_weight: 0.10
+
 timestral:
-  # Master switch: ``false`` reproduces the V4 six-pillar factor mix byte-for-byte.
+  # Master switch for the Timestral pillar. Flex blending is configured separately above.
   enabled: true
   # CPU-friendly 5M checkpoint (~21 MB); Timestral-209M remains selectable here.
   model_id: mistralai/Timestral-5M

@@ -34,6 +34,7 @@ import pandas as pd
 from .config import Config
 from .flex_model.aladdin_features import flex as aladdin_flex
 from .flex_model.engine import EventKind
+from .flex_model.runtime import FlexModelReplayRuntime
 from .main_v4 import V4AutonomousPortfolioReducer, _jsonable, _resolve_markets
 from .state.ledger import Ledger
 from .verification.aladdin_golden_copy_and_risk import (
@@ -416,14 +417,14 @@ def main(argv: list[str] | None = None) -> int:
         offline=args.offline,
         embed_backend=args.backend,
     )
+    flex_enabled = bool(config.get("aladdin.flex_model.enabled", True))
+    if flex_enabled:
+        reducer.flex_runtime = FlexModelReplayRuntime(args.state_dir, aladdin_flex)
     pipeline = V5OpenAladdinPipeline(reducer, config)
     pipeline.ingest_golden_shards()
-    # Compile the event-oriented feature plans at startup, with market pruning.
-    # The current reducer consumes batch lakehouse snapshots; these plans expose
-    # the streaming feature runtime without silently replacing its production
-    # batch factors until event-state persistence and replay are wired end to end.
+    # Include the market-pruned execution plans in the run manifest for auditability.
     flex_model = {
-        "runtime": "compiled_reference_plans",
+        "runtime": "pit_event_replay_with_persisted_arena" if flex_enabled else "disabled",
         "plans": {
             market: {
                 event.name: aladdin_flex.compile_plan(market, event).describe_plan()
@@ -433,6 +434,10 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
     summary = reducer.run(markets, mode=mode)
+    flex_model["markets"] = {
+        market: (summary.get("markets", {}).get(market, {}).get("flex_model") or {})
+        for market in markets
+    }
     summary["flex_model"] = flex_model
     telemetry = pipeline.process(summary)
 

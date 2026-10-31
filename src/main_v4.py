@@ -110,6 +110,7 @@ class V4AutonomousPortfolioReducer:
         self.timestral_engine = TimestralForecastEngine(config) if self.timestral_enabled else None
         # ``market -> ticker-indexed Timestral frame`` for the V5 forward-CVaR fusion.
         self.timestral_frames: dict[str, pd.DataFrame] = {}
+        self.flex_spillover_scores: dict[str, pd.Series] = {}
         self.run_id = f"{uuid.uuid4().hex[:8]}-{self.as_of:%Y%m%d}"
         self.calibration_rows: list[dict[str, Any]] = []
 
@@ -255,6 +256,7 @@ class V4AutonomousPortfolioReducer:
 
         blend = float(self.config.e("spillover.blend_weight", 0.5))
         spin = self.spillover_scores(market, returns)
+        self.flex_spillover_scores[market] = spin
         if not spin.empty:
             common = scores.index.intersection(spin.index)
             scores.loc[common] = (1.0 - blend) * zscore(scores.loc[common], 0.01) + blend * zscore(spin.loc[common], 0.01)
@@ -567,6 +569,44 @@ class V4AutonomousPortfolioReducer:
         sectors = None
         if not fundamentals.empty and "gics_sector" in fundamentals.columns:
             sectors = fundamentals["gics_sector"].reindex(universe_index)
+
+        flex_runtime = getattr(self, "flex_runtime", None)
+        flex_frame = pd.DataFrame(index=universe_index)
+        if flex_runtime is not None:
+            flex_frame, flex_diagnostics = flex_runtime.replay(
+                market=market,
+                tickers=universe_index,
+                as_of=self.as_of,
+                prices=self.price_snapshot(market),
+                actions=self.lake.read("corporate_actions"),
+                fundamentals=fundamentals,
+                tech=tech,
+                policy_scores=policy_scores,
+                spillover_scores=self.flex_spillover_scores.get(market, pd.Series(dtype=float)),
+            )
+            flex_frame = flex_frame.reindex(universe_index).fillna(0.0)
+            blend = float(self.config.get("aladdin.flex_model.blend_weight", 0.25))
+            spread_penalty = float(self.config.get("aladdin.flex_model.spread_penalty_weight", 0.10))
+            flex_trend = zscore(flex_frame.get("f_kalman_velocity", pd.Series(0.0, index=universe_index)), 0.0)
+            flex_spread = zscore(
+                flex_frame.get("corwin_schultz_effective_spread", pd.Series(0.0, index=universe_index)), 0.01
+            )
+            trend = zscore((1.0 - blend) * trend + blend * flex_trend - spread_penalty * flex_spread, 0.0)
+
+            flex_quality = zscore(flex_frame.get("f_fundamentals", pd.Series(0.0, index=universe_index)), 0.0)
+            quality = zscore((1.0 - blend) * quality + blend * flex_quality, 0.0)
+            flex_tech = zscore(flex_frame.get("f_tech_patent_velocity", pd.Series(0.0, index=universe_index)), 0.0)
+            tech_scores = zscore((1.0 - blend) * tech_scores + blend * flex_tech, 0.0)
+            flex_policy = zscore(
+                flex_frame.get("f_policy_geopol_accumulator", pd.Series(0.0, index=universe_index)), 0.0
+            )
+            policy_scores = zscore((1.0 - blend) * policy_scores + blend * flex_policy, 0.0)
+            flex_spillover = zscore(
+                flex_frame.get("f_us_to_india_spillover", pd.Series(0.0, index=universe_index)), 0.0
+            )
+            if market == "INDIA" and not self.flex_spillover_scores.get(market, pd.Series(dtype=float)).empty:
+                macro_beta = zscore((1.0 - blend) * macro_beta + blend * flex_spillover, 0.0)
+            diagnostics["flex_model"] = flex_diagnostics
 
         # Stage-3 7th pillar: Timestral's covariate-conditioned forward quantiles.
         # A failure here must never take the fan-in down: record the mode and move on.

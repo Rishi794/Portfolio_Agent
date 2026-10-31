@@ -1,8 +1,7 @@
-"""Reference Aladdin feature registry built from event-local vector kernels.
+"""Aladdin feature registry built from event-local vector kernels.
 
-These are streaming features for users of the Flex runtime. The existing V5
-batch reducer remains the production source of its current factors until batch
-snapshots are deliberately migrated to these event semantics.
+V5 replays PIT lakehouse bars and fact snapshots through these handlers, persists
+their arena state, and blends their outputs into the production factor matrix.
 """
 
 from __future__ import annotations
@@ -61,21 +60,30 @@ def f_kalman_velocity(arena: ZeroAllocArena) -> np.ndarray:
     level = arena.ensure_state("kalman_level")
     velocity = arena.ensure_state("kalman_velocity")
     variance = arena.ensure_state("kalman_variance", fill=1e-4)
-    innovation = log_price - (level + velocity)
+    valid = np.isfinite(log_price)
+    innovation = np.where(valid, log_price - (level + velocity), np.nan)
     ring = arena.push_ring("f_kalman_velocity", innovation)
-    with np.errstate(invalid="ignore"):
-        innovation_var = np.nanmean(np.square(ring), axis=1)
+    squared = np.square(ring)
+    ring_count = np.sum(np.isfinite(squared), axis=1)
+    innovation_var = np.divide(
+        np.nansum(squared, axis=1), ring_count,
+        out=np.full(len(arena.tickers), 1e-8), where=ring_count > 0,
+    )
     scale2 = np.maximum(innovation_var, 1e-8)
     gain = np.clip(variance / (variance + scale2), 0.01, 0.99)
     next_level = level + velocity + gain * innovation
     next_velocity = velocity + 0.1 * gain * innovation
-    level[~initialized] = log_price[~initialized]
-    velocity[~initialized] = 0.0
-    level[initialized] = next_level[initialized]
-    velocity[initialized] = next_velocity[initialized]
-    variance[:] = np.maximum((1.0 - gain) * variance + 1e-8, 1e-10)
-    initialized[:] = True
-    return velocity / np.sqrt(scale2)
+    new_names = valid & ~initialized
+    continuing = valid & initialized
+    level[new_names] = log_price[new_names]
+    velocity[new_names] = 0.0
+    level[continuing] = next_level[continuing]
+    velocity[continuing] = next_velocity[continuing]
+    variance[valid] = np.maximum((1.0 - gain[valid]) * variance[valid] + 1e-8, 1e-10)
+    initialized[valid] = True
+    output = arena.read("f_kalman_velocity").copy()
+    output[valid] = velocity[valid] / np.sqrt(scale2[valid])
+    return output
 
 
 @flex.handler(
@@ -90,13 +98,18 @@ def corwin_schultz_effective_spread(arena: ZeroAllocArena) -> np.ndarray:
     low = arena.event_payload.get("low")
     if high is None or low is None:
         raise ValueError("EOD_BAR spread feature requires high and low")
-    safe_high = np.maximum(high, 1e-12)
-    safe_low = np.maximum(low, 1e-12)
-    range_sq = np.square(np.log(np.maximum(safe_high / safe_low, 1.0)))
+    valid = np.isfinite(high) & np.isfinite(low) & (high > 0.0) & (low > 0.0)
+    safe_high = np.maximum(np.nan_to_num(high, nan=1.0), 1e-12)
+    safe_low = np.maximum(np.nan_to_num(low, nan=1.0), 1e-12)
+    range_sq = np.where(valid, np.square(np.log(np.maximum(safe_high / safe_low, 1.0))), np.nan)
     rolling = arena.push_ring("corwin_schultz_effective_spread", range_sq)
     with np.errstate(invalid="ignore"):
-        mean = np.nanmean(rolling, axis=1)
-    return 0.25 * np.sqrt(np.maximum(mean, 0.0))
+        total = np.nansum(rolling, axis=1)
+        count = np.sum(np.isfinite(rolling), axis=1)
+    mean = np.divide(total, count, out=np.zeros_like(total), where=count > 0)
+    output = arena.read("corwin_schultz_effective_spread").copy()
+    output[valid] = 0.25 * np.sqrt(np.maximum(mean[valid], 0.0))
+    return output
 
 
 @flex.handler(
@@ -110,7 +123,14 @@ def core_fundamental_state(arena: ZeroAllocArena) -> np.ndarray:
     score = arena.event_payload.get("piotroski_f_score")
     if roic is None or fcf is None or score is None:
         raise ValueError("XBRL filing requires roic_spread, fcf_yield, and piotroski_f_score")
-    return 0.45 * roic + 0.35 * fcf + 0.20 * (score / 9.0)
+    candidate = 0.45 * roic + 0.35 * fcf + 0.20 * (score / 9.0)
+    mask = np.asarray(
+        arena.event_payload.get("core_event_mask", arena.event_payload.get("event_mask", np.ones(len(arena.tickers)))),
+        dtype=bool,
+    )
+    output = arena.read("core_fundamental_state").copy()
+    output[mask] = candidate[mask]
+    return output
 
 
 @flex.handler(
@@ -123,7 +143,14 @@ def india_promoter_pledge_penalty(arena: ZeroAllocArena) -> np.ndarray:
     flow = arena.event_payload.get("institutional_flow_delta")
     if pledge is None or flow is None:
         raise ValueError("India filing requires promoter_pledge_pct and institutional_flow_delta")
-    return 0.10 * flow - 0.005 * pledge
+    candidate = 0.10 * flow - 0.005 * pledge
+    mask = np.asarray(
+        arena.event_payload.get("pledge_event_mask", arena.event_payload.get("event_mask", np.ones(len(arena.tickers)))),
+        dtype=bool,
+    )
+    output = arena.read("india_promoter_pledge_penalty").copy()
+    output[mask] = candidate[mask]
+    return output
 
 
 @flex.eval(
@@ -162,7 +189,10 @@ def f_tech_patent_velocity(arena: ZeroAllocArena) -> np.ndarray:
     velocity = arena.event_payload.get("citation_velocity_log_ratio")
     if velocity is None:
         raise ValueError("patent event requires citation_velocity_log_ratio")
-    return velocity
+    mask = np.asarray(arena.event_payload.get("event_mask", np.ones(len(arena.tickers))), dtype=bool)
+    output = arena.read("f_tech_patent_velocity").copy()
+    output[mask] = velocity[mask]
+    return output
 
 
 @flex.handler(
