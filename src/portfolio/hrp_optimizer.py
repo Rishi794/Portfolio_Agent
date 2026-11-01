@@ -8,8 +8,8 @@ Steps
 3. recursive bisection allocating inverse-variance weights inside each cluster;
 4. alpha tilt: ``w ~ w_HRP * exp(tilt * clip(z_alpha))`` (a Bayesian tilt away from
    pure risk parity toward expected return, strength from config);
-5. weight cap + cash buffer scaling, then a KKT deadband filter that suppresses
-   any trade whose expected alpha gain cannot pay the stock-specific friction.
+5. weight cap + cash buffer scaling, then a cost/risk-based KKT no-trade band that
+   suppresses small rebalances where estimated friction dominates the risk benefit.
 """
 
 from __future__ import annotations
@@ -254,7 +254,7 @@ class HRPOptimizer:
                     alpha_z=float(alpha.get(ticker, 0.0)),
                     sector=str(sectors.get(ticker, "UNKNOWN")),
                     order_value=shares * price,
-                    reason="alpha_below_deadband" if not is_exit else "full_exit",
+                    reason="rebalance_outside_kkt_deadband" if not is_exit else "full_exit",
                 )
             )
         tickets.sort(key=lambda ticket: abs(ticket.order_value), reverse=True)

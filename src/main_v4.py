@@ -521,37 +521,150 @@ class V4AutonomousPortfolioReducer:
         return zscore(frame["f_timestral"].reindex(universe_index).fillna(0.0), 0.0)
 
     def _timestral_risk_inputs(
-        self, market: str, target: pd.Series, current_weights: dict[str, float]
+        self,
+        market: str,
+        target: pd.Series,
+        current_weights: dict[str, float],
+        tickets: list[dict[str, Any]] | None = None,
+        equity: float | None = None,
     ) -> dict[str, Any]:
-        """Weights-weighted forward tail metrics for the V5 forward-CVaR fusion.
+        """Return forecast attribution and forward tail metrics for the V5 fusion.
 
-        Uses the *post-trade* target book when one exists, otherwise the live book.
+        Return contributions use whole-account target weights, so cash and uncovered
+        positions are not silently removed from the denominator. The covered-sleeve
+        average is reported separately. This is a model estimate, not a guarantee.
         """
         if self.timestral_engine is None:
             return {"timestral_mode": "disabled"}
         out: dict[str, Any] = {"timestral_mode": self.timestral_engine.mode}
         frame = self.timestral_frames.get(market)
         if frame is None or frame.empty:
-            return out
-        weights = target if target is not None and not target.empty else pd.Series(current_weights, dtype=float)
+            return {
+                **out,
+                "timestral_covered_names": 0,
+                "timestral_forecast_coverage_pct": 0.0,
+                "timestral_forward_exp_ret_5d_covered_sleeve_pct": None,
+                "timestral_exp_ret_5d_portfolio_contribution_pct": None,
+            }
+        weights = (
+            target
+            if target is not None and not target.empty
+            else pd.Series(current_weights, dtype=float)
+        )
         if weights.empty:
-            return out
+            return {
+                **out,
+                "timestral_covered_names": 0,
+                "timestral_forecast_coverage_pct": 0.0,
+                "timestral_forward_exp_ret_5d_covered_sleeve_pct": None,
+                "timestral_exp_ret_5d_portfolio_contribution_pct": None,
+            }
         weights = pd.to_numeric(weights, errors="coerce").dropna()
         weights = weights[weights > 0.0]
-        common = weights.index.intersection(frame.index)
-        total = float(weights.reindex(common).sum())
-        if len(common) == 0 or not np.isfinite(total) or total <= 0.0:
-            return {**out, "timestral_covered_names": 0}
-        normalized = weights.reindex(common).to_numpy(dtype=float) / total
-        cvar = float(np.dot(normalized, frame.loc[common, "timestral_cvar99_pct"].to_numpy(dtype=float)))
-        expected = float(
-            np.dot(normalized, frame.loc[common, "timestral_exp_ret_5d_pct"].to_numpy(dtype=float))
+        invested_weight = float(weights.sum())
+        forecast = frame.reindex(weights.index)
+        expected_by_ticker = pd.to_numeric(
+            forecast.get("timestral_exp_ret_5d_pct", pd.Series(index=weights.index, dtype=float)),
+            errors="coerce",
+        )
+        cvar_by_ticker = pd.to_numeric(
+            forecast.get("timestral_cvar99_pct", pd.Series(index=weights.index, dtype=float)),
+            errors="coerce",
+        )
+        valid_return = expected_by_ticker.notna() & np.isfinite(expected_by_ticker)
+        valid_cvar = cvar_by_ticker.notna() & np.isfinite(cvar_by_ticker)
+        return_weights = weights[valid_return]
+        cvar_weights = weights[valid_cvar]
+        covered_weight = float(return_weights.sum())
+        coverage_pct = 100.0 * covered_weight / invested_weight if invested_weight > 0.0 else 0.0
+
+        # Forecast contribution to total account equity; leave cash/unforecast names
+        # in the denominator instead of re-normalizing them into a 100% portfolio.
+        gross_contribution = (
+            float(
+                np.dot(
+                    return_weights.to_numpy(dtype=float),
+                    expected_by_ticker.loc[return_weights.index].to_numpy(dtype=float),
+                )
+            )
+            if covered_weight > 0.0
+            else None
+        )
+        covered_sleeve_return = (
+            gross_contribution / covered_weight if gross_contribution is not None else None
+        )
+        cvar_weight = float(cvar_weights.sum())
+        cvar = (
+            float(
+                np.dot(
+                    cvar_weights.to_numpy(dtype=float) / cvar_weight,
+                    cvar_by_ticker.loc[cvar_weights.index].to_numpy(dtype=float),
+                )
+            )
+            if cvar_weight > 0.0
+            else None
+        )
+
+        # Cost model returns one-way bps. Sum the final (post-compliance, when V5)
+        # order costs against total account equity; this is an estimated rebalance
+        # drag, not a forecast of future exit costs.
+        estimated_cost_pct = None
+        if equity is not None and np.isfinite(equity) and equity > 0.0:
+            cost_value = 0.0
+            for order in tickets or []:
+                try:
+                    notional = abs(float(order.get("order_value", 0.0) or 0.0))
+                    cost_bps = max(float(order.get("est_cost_bps", 0.0) or 0.0), 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(notional) and np.isfinite(cost_bps):
+                    cost_value += notional * cost_bps / 10_000.0
+            estimated_cost_pct = cost_value / float(equity) * 100.0
+        net_contribution = (
+            gross_contribution - estimated_cost_pct
+            if gross_contribution is not None and estimated_cost_pct is not None
+            else None
+        )
+        gross_gain_value = (
+            gross_contribution * float(equity) / 100.0
+            if gross_contribution is not None and equity is not None and np.isfinite(equity)
+            else None
+        )
+        net_gain_value = (
+            net_contribution * float(equity) / 100.0
+            if net_contribution is not None and equity is not None and np.isfinite(equity)
+            else None
         )
         return {
             **out,
-            "timestral_forward_cvar99_pct": round(cvar, 4),
-            "timestral_exp_ret_5d_weighted_pct": round(expected, 4),
-            "timestral_covered_names": int(len(common)),
+            "timestral_forward_cvar99_pct": round(cvar, 4) if cvar is not None else None,
+            # Retained for consumers of the previous telemetry schema. This is a
+            # covered-sleeve average, not a whole-portfolio return.
+            "timestral_exp_ret_5d_weighted_pct": round(covered_sleeve_return, 4)
+            if covered_sleeve_return is not None
+            else None,
+            "timestral_forward_exp_ret_5d_covered_sleeve_pct": round(covered_sleeve_return, 4)
+            if covered_sleeve_return is not None
+            else None,
+            "timestral_exp_ret_5d_portfolio_contribution_pct": round(gross_contribution, 4)
+            if gross_contribution is not None
+            else None,
+            "timestral_net_exp_ret_5d_portfolio_contribution_pct": round(net_contribution, 4)
+            if net_contribution is not None
+            else None,
+            "timestral_exp_gain_5d_portfolio_value": round(gross_gain_value, 2)
+            if gross_gain_value is not None
+            else None,
+            "timestral_net_exp_gain_5d_portfolio_value": round(net_gain_value, 2)
+            if net_gain_value is not None
+            else None,
+            "timestral_estimated_rebalance_cost_pct": round(estimated_cost_pct, 4)
+            if estimated_cost_pct is not None
+            else None,
+            "timestral_forecast_coverage_pct": round(coverage_pct, 2),
+            "timestral_invested_weight_pct": round(invested_weight * 100.0, 2),
+            "timestral_covered_weight_pct": round(covered_weight * 100.0, 2),
+            "timestral_covered_names": int(len(return_weights)),
         }
 
     def build_factor_matrix(
@@ -831,15 +944,22 @@ class V4AutonomousPortfolioReducer:
         price_frame = self.price_snapshot(market)
         deadbands: dict[str, float] = {}
         costs_bps: dict[str, float] = {}
-        for ticker in target.index:
+        for ticker in sorted(set(target.index) | set(current_weights)):
             history = price_frame[price_frame["ticker"] == ticker].tail(60)
             estimate = self.engine.estimate_transaction_cost(
                 market=market,
                 high=history["high"].to_numpy(dtype=float) if not history.empty else None,
                 low=history["low"].to_numpy(dtype=float) if not history.empty else None,
                 close=history["adj_close"].to_numpy(dtype=float) if not history.empty else None,
-                order_value=float(target.get(ticker, 0.0)) * equity,
-                adv=float(history["dollar_volume"].tail(20).mean()) if not history.empty and "dollar_volume" in history else float("nan"),
+                order_value=(
+                    abs(float(target.get(ticker, 0.0)) - float(current_weights.get(ticker, 0.0)))
+                    * equity
+                ),
+                adv=(
+                    float(history["dollar_volume"].tail(20).mean())
+                    if not history.empty and "dollar_volume" in history
+                    else float("nan")
+                ),
                 market_returns=market_returns,
             )
             deadbands[ticker] = estimate.deadband
@@ -906,7 +1026,7 @@ class V4AutonomousPortfolioReducer:
             equity,
         )
         diagnostics.update(allocation_diagnostics)
-        diagnostics.update(self._timestral_risk_inputs(market, target, current_weights))
+        diagnostics.update(self._timestral_risk_inputs(market, target, current_weights, tickets, equity))
 
         scores_table = self.factor_score_table(market, ortho, alpha, regime)
         if not scores_table.empty:

@@ -151,8 +151,8 @@ def _order_block(summary: dict[str, Any], top_n: int) -> list[str]:
     lines = ["## Pending orders (await approval)", ""]
     if not tickets:
         lines.append(
-            "✅ **No trades outside the no-trade deadband.** Every target weight is already inside its "
-            "stock-specific KKT band `δ̂ = ĉ / (γ̂ σ̂²)`, so paying friction would destroy alpha."
+            "✅ **No orders emitted.** Target changes did not clear the stock-specific, cost/risk-based "
+            "KKT no-trade band `δ̂ = ĉ / (γ̂ σ̂²)`. This is a turnover control, not a profit guarantee."
         )
         lines.append("")
         return lines

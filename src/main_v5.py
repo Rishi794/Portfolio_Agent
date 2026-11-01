@@ -195,7 +195,11 @@ class V5OpenAladdinPipeline:
                 run["diagnostics"]["target_names"] = sum(weight > 0.0 for weight in targets.values())
                 run["diagnostics"].update(
                     self.reducer._timestral_risk_inputs(
-                        market, pd.Series(targets, dtype=float), ledger.current_weights(snapshot)
+                        market,
+                        pd.Series(targets, dtype=float),
+                        ledger.current_weights(snapshot),
+                        approved,
+                        equity,
                     )
                 )
 
@@ -280,7 +284,11 @@ class V5OpenAladdinPipeline:
         # expected shortfall, the Timestral number a forward quantile, so Timestral
         # can only bind when its forward tail is genuinely deeper.
         diagnostics = run.get("diagnostics") or {}
-        timestral_cvar = max(float(diagnostics.get("timestral_forward_cvar99_pct", 0.0) or 0.0), 0.0)
+        raw_timestral_cvar = diagnostics.get("timestral_forward_cvar99_pct")
+        try:
+            timestral_cvar = max(float(raw_timestral_cvar), 0.0) if raw_timestral_cvar is not None else 0.0
+        except (TypeError, ValueError):
+            timestral_cvar = 0.0
         fused_cvar = max(float(cvar_pct), timestral_cvar)
         binding_source = "timestral" if timestral_cvar > float(cvar_pct) + 1e-12 else "student_t"
 
@@ -296,7 +304,26 @@ class V5OpenAladdinPipeline:
             "daily_fused_cvar99_pct": round(fused_cvar, 4),
             "cvar_binding_source": binding_source,
             "timestral_mode": diagnostics.get("timestral_mode"),
-            "timestral_forward_exp_ret_5d_pct": diagnostics.get("timestral_exp_ret_5d_weighted_pct"),
+            "timestral_forward_exp_ret_5d_pct": diagnostics.get(
+                "timestral_forward_exp_ret_5d_covered_sleeve_pct"
+            ),
+            "timestral_exp_ret_5d_portfolio_contribution_pct": diagnostics.get(
+                "timestral_exp_ret_5d_portfolio_contribution_pct"
+            ),
+            "timestral_net_exp_ret_5d_portfolio_contribution_pct": diagnostics.get(
+                "timestral_net_exp_ret_5d_portfolio_contribution_pct"
+            ),
+            "timestral_exp_gain_5d_portfolio_value": diagnostics.get(
+                "timestral_exp_gain_5d_portfolio_value"
+            ),
+            "timestral_net_exp_gain_5d_portfolio_value": diagnostics.get(
+                "timestral_net_exp_gain_5d_portfolio_value"
+            ),
+            "timestral_estimated_rebalance_cost_pct": diagnostics.get(
+                "timestral_estimated_rebalance_cost_pct"
+            ),
+            "timestral_forecast_coverage_pct": diagnostics.get("timestral_forecast_coverage_pct", 0.0),
+            "timestral_invested_weight_pct": diagnostics.get("timestral_invested_weight_pct", 0.0),
             "cvar_confidence": self.engine.confidence,
             "weight_basis": "invested_sleeve_normalized",
             "euler_risk_table": euler_rows,
@@ -374,6 +401,7 @@ def format_aladdin_markdown(summary: dict[str, Any], telemetry: dict[str, Any]) 
         "",
     ]
     for market, info in (telemetry.get("markets") or {}).items():
+        currency = "₹" if market == "INDIA" else "$"
         quarantined = info.get("quarantined_tickers") or []
         blocked = info.get("compliance_blocked_orders") or []
         scaled = info.get("compliance_scaled_orders") or []
@@ -387,7 +415,16 @@ def format_aladdin_markdown(summary: dict[str, Any], telemetry: dict[str, Any]) 
         )
         lines.append(
             f"- **Timestral 7th pillar:** mode `{info.get('timestral_mode') or 'disabled'}` · "
-            f"forward 5-day expected return `{_fmt_optional(info.get('timestral_forward_exp_ret_5d_pct'))}%`"
+            f"5-day model-estimated return for covered sleeve "
+            f"`{_fmt_optional(info.get('timestral_forward_exp_ret_5d_pct'))}%` · "
+            f"whole-account contribution "
+            f"`{_fmt_optional(info.get('timestral_exp_ret_5d_portfolio_contribution_pct'))}%` "
+            f"({currency}{_fmt_optional(info.get('timestral_exp_gain_5d_portfolio_value'))} gross) · "
+            f"after estimated rebalance costs "
+            f"`{_fmt_optional(info.get('timestral_net_exp_ret_5d_portfolio_contribution_pct'))}%` "
+            f"({currency}{_fmt_optional(info.get('timestral_net_exp_gain_5d_portfolio_value'))} net) · "
+            f"forecast covers `{float(info.get('timestral_forecast_coverage_pct') or 0.0):.1f}%` of invested weight "
+            "(uncovered holdings contribute zero; estimates are not guaranteed gains)"
         )
         lines.append(
             f"- **Golden-copy quarantine:** `{len(quarantined)}`"
