@@ -62,6 +62,21 @@ Flex velocity, fundamental, patent, policy, and India spillover outputs are blen
 into their corresponding batch pillars before Löwdin orthogonalization and IC-IR
 weight learning. Its rolling spread estimate penalizes the trend input.
 
+### Matured forecast feedback and daily summary
+
+V4/V5 evaluate stored forecasts only after their configured exchange-session horizon
+has passed, using non-overlapping windows. The existing IC-IR learner remains the
+factor-weight learner; a Beta(1,1) hit-rate estimate may shrink a ticker's alpha by
+at most the configured cap after the minimum sample size. Hit rate alone never
+quarantines a ticker. Timestral's summed daily 5th/95th quantiles are treated as an
+interval proxy and widened using matured empirical misses; this is not a formal
+coverage guarantee and does not alter the separate CVaR99 risk estimate.
+
+The V5 fan-in writes `SUMMARY.md` with current BUY/SELL proposals, ledger holdings,
+data-quality exclusions and matured feedback. The same summary is included in the
+daily recommendation Issue and uploaded as a 30-day workflow artifact. Proposed
+orders still require the existing approval step.
+
 ### The Stage-3 Timestral pillar (7th domain)
 
 `src/filtering/timestral_forecaster.py` wraps Mistral's **Timestral** forecasting
@@ -184,7 +199,8 @@ Then:
 
 * the pipeline opens **“📈 V5 Open-Aladdin Rebalance Recommendation — YYYY-MM-DD”**
   with the full ticket, calibration table, order list and the V5 risk-telemetry
-  section (Euler decomposition, CVaR99, scenario stress, compliance interventions);
+  section (Euler decomposition, CVaR99, scenario stress, compliance interventions),
+  including `SUMMARY.md` and a downloadable 30-day summary artifact;
 * comment `/approve` to book every pending order at reference price + estimated
   spread/statutory fees, or `/approve NVDA=25@128.40 RELIANCE.NS=40@2945.50` to book
   real broker fills;

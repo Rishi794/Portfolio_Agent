@@ -347,8 +347,17 @@ jobs:
             --shards-dir ../staged_shards \
             --state-dir ../state_branch \
             --output-issue ../issue_body.md \
+            --summary-markdown SUMMARY.md \
             --dashboard-html ../pages_dist/index.html \
             --backend onnx
+
+      - name: Preserve the daily investment summary
+        uses: actions/upload-artifact@v7
+        with:
+          name: investment-summary-${{ needs.prepare.outputs.run_label }}
+          path: repo/SUMMARY.md
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Verify Parquet integrity before publishing
         working-directory: repo

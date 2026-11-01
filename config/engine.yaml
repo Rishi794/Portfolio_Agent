@@ -193,6 +193,16 @@ historical_ingestion:
   warm_delta_sessions: 5             # overlap the latest sessions to repair missed runs
   max_india_official_refresh_sessions: 30
 
+# ------------------------------------------------- matured forecast feedback --
+forecast_feedback:
+  enabled: true
+  horizon_sessions: 5
+  max_nonoverlap_windows: 120
+  min_reliability_observations: 20
+  max_reliability_discount: 0.25     # low-hit-rate alpha shrink, never hard quarantine
+  conformal_target_coverage: 0.90
+  min_conformal_samples: 100
+
 # ------------------------------------------------ IC-IR factor weighting ---
 factor_learning:
   mode: ic_ir                       # 'ic_ir' (endogenous) | 'regime_prior'

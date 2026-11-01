@@ -485,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shards-dir", type=Path, default=None)
     parser.add_argument("--state-dir", type=Path, default=Path("state"))
     parser.add_argument("--output-issue", type=Path, default=None)
+    parser.add_argument("--summary-markdown", type=Path, default=Path("SUMMARY.md"))
     parser.add_argument("--dashboard-html", type=Path, default=None)
     parser.add_argument("--as-of", default=None)
     parser.add_argument("--backend", default="auto", choices=["auto", "onnx", "hashing"])
@@ -549,11 +550,23 @@ def main(argv: list[str] | None = None) -> int:
     summary["flex_model"] = flex_model
     telemetry = pipeline.process(summary)
 
+    from .reporting.investment_summary_generator import InvestmentSummaryGenerator
+
+    summary_markdown = InvestmentSummaryGenerator.render(
+        summary,
+        args.state_dir,
+        args.summary_markdown,
+        starting_cash=reducer.starting_cash,
+    )
+
     if args.output_issue:
         from .reporting.issue_builder import build_issue_body
 
         build_issue_body(summary, config, args.output_issue, lake=reducer.lake, state_dir=args.state_dir)
         with Path(args.output_issue).open("a", encoding="utf-8") as handle:
+            handle.write("\n---\n\n")
+            handle.write(summary_markdown)
+            handle.write("\n")
             handle.write(format_aladdin_markdown(summary, telemetry))
     if args.dashboard_html:
         from .reporting.dashboard_builder import build_dashboard_html

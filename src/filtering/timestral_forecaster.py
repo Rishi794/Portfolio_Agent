@@ -77,7 +77,9 @@ TIMESTRAL_QUANTILES = np.array(
 )
 
 _LEVEL = {level: index for index, level in enumerate(TIMESTRAL_QUANTILES.tolist())}
-_Q01, _Q05, _Q50, _Q90 = _LEVEL[0.01], _LEVEL[0.05], _LEVEL[0.50], _LEVEL[0.90]
+_Q01, _Q05, _Q50, _Q90, _Q95 = (
+    _LEVEL[0.01], _LEVEL[0.05], _LEVEL[0.50], _LEVEL[0.90], _LEVEL[0.95]
+)
 
 #: Must match ``PILLARS`` in ``src.main_v4`` — the pillar name registered in the lakehouse.
 TIMESTRAL_PILLAR = "timestral"
@@ -87,6 +89,8 @@ OUTPUT_COLUMNS = (
     "timestral_exp_ret_5d_pct",
     "timestral_cvar99_pct",
     "timestral_cvar99_5d_pct",
+    "timestral_q05_5d_pct",
+    "timestral_q95_5d_pct",
 )
 
 
@@ -308,12 +312,16 @@ class TimestralForecastEngine:
         # because a quantile is always weaker than the expected shortfall beyond it.
         cvar_1d_pct = abs(min(0.0, float(matrix[0, _Q01]) * daily_vol)) * 100.0
         cvar_horizon_pct = float(np.sum(np.maximum(0.0, -matrix[:, _Q01])) * daily_vol) * 100.0
+        q05_horizon_pct = float(np.expm1(np.sum(matrix[:, _Q05]) * daily_vol)) * 100.0
+        q95_horizon_pct = float(np.expm1(np.sum(matrix[:, _Q95]) * daily_vol)) * 100.0
 
         return {
             "f_timestral": round(float(score), 4),
             "timestral_exp_ret_5d_pct": round(expected_return * 100.0, 3),
             "timestral_cvar99_pct": round(cvar_1d_pct, 3),
             "timestral_cvar99_5d_pct": round(cvar_horizon_pct, 3),
+            "timestral_q05_5d_pct": round(q05_horizon_pct, 3),
+            "timestral_q95_5d_pct": round(q95_horizon_pct, 3),
         }
 
     # ------------------------------------------------------------- inference ---

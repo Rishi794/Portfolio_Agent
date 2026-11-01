@@ -200,3 +200,86 @@ def test_reducer_rebuilds_yahoo_adjusted_prices_after_new_action(tmp_path):
 
     assert prices["adj_close"].tolist() == [50.0, 50.0]
     assert prices["close"].tolist() == [100.0, 50.0]
+
+
+def test_matured_feedback_uses_trading_sessions_and_only_shrinks_low_reliability_names(tmp_path):
+    config = Config.load()
+    config._raw["engine"]["forecast_feedback"].update(
+        {
+            "horizon_sessions": 5,
+            "max_nonoverlap_windows": 20,
+            "min_reliability_observations": 2,
+            "max_reliability_discount": 0.25,
+            "min_conformal_samples": 1,
+        }
+    )
+    lake = Lakehouse(tmp_path / "lake")
+    dates = pd.bdate_range("2026-01-05", periods=21)
+    prices = pd.DataFrame(
+        [
+            {
+                "ticker": ticker,
+                "market": "US",
+                "price_source": "YAHOO_FINANCE",
+                "date": date,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1000.0,
+                "adj_close": close,
+                "dollar_volume": close * 1000.0,
+                "knowledge_timestamp": pd.Timestamp(date, tz="UTC") + pd.Timedelta(hours=23),
+            }
+            for index, date in enumerate(dates)
+            for ticker, close in (("AAA", 100.0 - index), ("BBB", 100.0 + index))
+        ]
+    )
+    lake.write("market_prices", prices)
+    forecasts = []
+    for index in range(0, 16, 5):
+        for ticker in ("AAA", "BBB"):
+            forecasts.append(
+                {
+                    "date": dates[index],
+                    "ticker": ticker,
+                    "market": "US",
+                    "kalman_trend": 1.0,
+                    "fundamentals": 0.0,
+                    "tech_evolution": 0.0,
+                    "gov_policy": 0.0,
+                    "geopolitics": 0.0,
+                    "macro_beta": 0.0,
+                    "timestral": 0.0,
+                    "composite_alpha": 1.0,
+                    "timestral_q05_5d_raw_pct": -1.0,
+                    "timestral_q95_5d_raw_pct": 1.0,
+                }
+            )
+    lake.write("factor_scores", pd.DataFrame(forecasts))
+
+    reducer = object.__new__(V4AutonomousPortfolioReducer)
+    reducer.config = config
+    reducer.lake = lake
+    reducer.as_of = pd.Timestamp(dates[-1])
+    reducer.timestral_enabled = True
+    reducer.feedback_cache = {}
+    reducer.calibration_rows = []
+
+    feedback = reducer._matured_forecast_feedback("US")
+    adjusted, shrunk = reducer.apply_matured_stock_reliability(
+        "US", pd.Series({"AAA": 1.0, "BBB": 1.0})
+    )
+    calibrated = reducer.calibrate_timestral_intervals(
+        "US", pd.DataFrame({"timestral_q05_5d_pct": [-2.0], "timestral_q95_5d_pct": [2.0]})
+    )
+
+    assert feedback["evaluations"] == 8
+    assert feedback["reliability"]["AAA"]["multiplier"] == 0.75
+    assert feedback["reliability"]["BBB"]["multiplier"] == 1.0
+    assert shrunk == 1
+    assert adjusted["AAA"] == 0.75
+    assert adjusted["BBB"] == 1.0
+    assert feedback["conformal_offset_pct"] > 0.0
+    assert calibrated.at[0, "timestral_q05_5d_calibrated_pct"] < -2.0
+    assert calibrated.at[0, "timestral_q95_5d_calibrated_pct"] > 2.0

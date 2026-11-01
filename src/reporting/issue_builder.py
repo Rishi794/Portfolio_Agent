@@ -105,6 +105,55 @@ def _market_block(market: str, run, diagnostics: dict[str, Any], top_n: int) -> 
         f"‖F F' /N − I‖_F `{_fmt(diagnostics.get('orthogonality_error'))}`"
     )
     lines.append("")
+    feedback = diagnostics.get("forecast_feedback", {}) or {}
+    if feedback:
+        accuracy = feedback.get("directional_accuracy")
+        accuracy_text = "n/a" if accuracy is None else f"{float(accuracy) * 100.0:.1f}%"
+        lines.extend(
+            [
+                "### Matured forecast feedback",
+                "",
+                (
+                    f"- Matured non-overlapping {feedback.get('nonoverlap_horizon_sessions', 5)}-session forecasts: "
+                    f"{feedback.get('matured_evaluations', 0)}; directional accuracy: `{accuracy_text}`."
+                    if feedback.get("matured_evaluations", 0)
+                    else "- No matured forecast labels were available in this run."
+                ),
+                f"- Empirical additive offset: `{_fmt(feedback.get('timestral_interval_offset_pct'))}%` "
+                f"from {feedback.get('timestral_interval_samples', 0)} matured intervals. The summed daily quantiles "
+                "are a 5th/95th interval proxy; this is not a formal coverage guarantee and does not scale the "
+                "separate 99% CVaR estimate.",
+                f"- Bounded reliability shrink applied to {feedback.get('stock_signals_shrunk', 0)} ticker signals. "
+                "No ticker is automatically quarantined based on directional hit rate.",
+                "- Factor attribution below is descriptive signal contribution, not causal blame.",
+                "",
+            ]
+        )
+        recent_misses = feedback.get("recent_misses", []) or []
+        if recent_misses:
+            lines.extend(
+                [
+                    "| Forecast date | Ticker | Alpha Z | Realized 5-session return | Outcome | Largest aligned factor |",
+                    "| :--- | :--- | ---: | ---: | :--- | :--- |",
+                ]
+            )
+            for miss in recent_misses[:8]:
+                lines.append(
+                    f"| `{miss.get('pred_date', '')}` | `{miss.get('ticker', '')}` | "
+                    f"{float(miss.get('pred_alpha_z', 0.0)):+.2f} | "
+                    f"{float(miss.get('realized_ret_pct', 0.0)):+.2f}% | "
+                    f"`{miss.get('failure_mode', '')}` | `{miss.get('largest_signal_aligned_pillar') or 'n/a'}` |"
+                )
+            lines.append("")
+        weak_names = feedback.get("low_reliability_names", []) or []
+        if weak_names:
+            lines.append("Low-reliability signals were shrunk within the configured cap (not excluded):")
+            lines.append(", ".join(
+                f"`{item['ticker']}` ({item['posterior_mean']:.0%} posterior hit rate, "
+                f"{item['observations']} windows, ×{item['alpha_multiplier']:.2f})"
+                for item in weak_names
+            ))
+            lines.append("")
     policy = diagnostics.get("policy", {}) or {}
     geopolitics = diagnostics.get("geopolitics", {}) or {}
     lines.append(

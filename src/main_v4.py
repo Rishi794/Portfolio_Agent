@@ -114,6 +114,7 @@ class V4AutonomousPortfolioReducer:
         self.flex_spillover_scores: dict[str, pd.Series] = {}
         self.run_id = f"{uuid.uuid4().hex[:8]}-{self.as_of:%Y%m%d}"
         self.calibration_rows: list[dict[str, Any]] = []
+        self.feedback_cache: dict[str, dict[str, Any]] = {}
 
     @property
     def as_of_utc_cutoff(self) -> pd.Timestamp:
@@ -510,6 +511,7 @@ class V4AutonomousPortfolioReducer:
             ex_dates_by_ticker=self._known_ex_dates(market),
             macro_frame=macro_matrix,
         )
+        frame = self.calibrate_timestral_intervals(market, frame)
         self.timestral_frames[market] = frame
         if frame.empty:
             return pd.Series(dtype=float)
@@ -823,6 +825,273 @@ class V4AutonomousPortfolioReducer:
             "learned_weights": np.round(np.asarray(learned["weights"], dtype=float), 4).tolist(),
         }
 
+    def _matured_forecast_feedback(self, market: str) -> dict[str, Any]:
+        """Evaluate prior forecasts only after the configured number of sessions.
+
+        The lakehouse already records each day's orthogonal factors and composite
+        alpha. Pair those forecasts with prices exactly H trading sessions later,
+        sampling non-overlapping windows to reduce dependence between labels.
+        """
+        if market in self.feedback_cache:
+            return self.feedback_cache[market]
+        empty: dict[str, Any] = {
+            "evaluations": 0,
+            "directional_accuracy": None,
+            "reliability": {},
+            "conformal_offset_pct": 0.0,
+            "recent_misses": [],
+        }
+        if not bool(self.config.e("forecast_feedback.enabled", True)):
+            self.feedback_cache[market] = empty
+            return empty
+
+        scores = self.lake.read("factor_scores")
+        close = self.close_wide(market)
+        if scores.empty or close.empty or "composite_alpha" not in scores:
+            self.feedback_cache[market] = empty
+            return empty
+
+        close = close.sort_index()
+        close.index = pd.DatetimeIndex(pd.to_datetime(close.index, errors="coerce")).normalize()
+        price_dates = list(close.index)
+        position_by_date = {date: index for index, date in enumerate(price_dates)}
+        frame = scores[scores["market"].astype(str) == market].copy()
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+        frame = frame[
+            frame["date"].notna()
+            & (frame["date"] < self.as_of)
+            & frame["date"].isin(position_by_date)
+        ]
+        if frame.empty:
+            self.feedback_cache[market] = empty
+            return empty
+
+        horizon = max(int(self.config.e("forecast_feedback.horizon_sessions", 5)), 1)
+        max_windows = max(int(self.config.e("forecast_feedback.max_nonoverlap_windows", 120)), 1)
+        candidates = sorted(frame["date"].drop_duplicates().tolist())
+        mature_dates = [
+            date
+            for date in candidates
+            if position_by_date[date] + horizon < len(price_dates)
+        ]
+        # Select the newest non-overlapping forecast windows; the horizon is in
+        # exchange sessions, never calendar days.
+        selected: list[pd.Timestamp] = []
+        last_position: int | None = None
+        for date in reversed(mature_dates):
+            position = position_by_date[date]
+            if last_position is None or last_position - position >= horizon:
+                selected.append(date)
+                last_position = position
+                if len(selected) >= max_windows:
+                    break
+        selected.reverse()
+
+        calibration = self.lake.read("calibration_state")
+        weights_by_date: dict[pd.Timestamp, dict[str, float]] = {}
+        if not calibration.empty:
+            weights = calibration[
+                (calibration["scope"].astype(str) == f"{market}:factor_weight")
+                & (calibration["parameter"].astype(str).isin(self.pillar_names()))
+            ].copy()
+            if not weights.empty:
+                weights["as_of_date"] = pd.to_datetime(weights["as_of_date"], errors="coerce").dt.normalize()
+                for date, group in weights.dropna(subset=["as_of_date"]).groupby("as_of_date"):
+                    weights_by_date[pd.Timestamp(date)] = {
+                        str(row.parameter): float(row.value)
+                        for row in group.itertuples(index=False)
+                        if np.isfinite(float(row.value))
+                    }
+
+        records: list[dict[str, Any]] = []
+        for date in selected:
+            position = position_by_date[date]
+            future_date = price_dates[position + horizon]
+            entry = pd.to_numeric(close.loc[date], errors="coerce")
+            future = pd.to_numeric(close.loc[future_date], errors="coerce")
+            realized_pct = (future.div(entry.where(entry != 0.0)) - 1.0) * 100.0
+            date_scores = frame[frame["date"] == date].drop_duplicates("ticker", keep="last").set_index("ticker")
+            # Compare the realized cross-section against the names that actually
+            # had forecasts that day; unrelated securities in the wider price
+            # table must not change the evaluation labels.
+            realized_forecasts = realized_pct.reindex(date_scores.index).dropna()
+            realized_z = zscore(realized_forecasts, 0.0)
+            for ticker in date_scores.index.intersection(realized_forecasts.index):
+                prediction = pd.to_numeric(date_scores.at[ticker, "composite_alpha"], errors="coerce")
+                actual_pct = float(realized_pct[ticker])
+                actual_z = float(realized_z.get(ticker, np.nan))
+                if not np.isfinite(prediction) or not np.isfinite(actual_z):
+                    continue
+                lower = pd.to_numeric(
+                    date_scores.at[ticker, "timestral_q05_5d_raw_pct"]
+                    if "timestral_q05_5d_raw_pct" in date_scores.columns
+                    else np.nan,
+                    errors="coerce",
+                )
+                upper = pd.to_numeric(
+                    date_scores.at[ticker, "timestral_q95_5d_raw_pct"]
+                    if "timestral_q95_5d_raw_pct" in date_scores.columns
+                    else np.nan,
+                    errors="coerce",
+                )
+                interval_score = (
+                    max(float(lower) - actual_pct, actual_pct - float(upper), 0.0)
+                    if np.isfinite(lower) and np.isfinite(upper)
+                    else np.nan
+                )
+                hit = bool(float(prediction) * actual_z > 0.0)
+                record: dict[str, Any] = {
+                    "pred_date": date,
+                    "ticker": str(ticker),
+                    "pred_alpha_z": float(prediction),
+                    "realized_z": actual_z,
+                    "realized_ret_pct": actual_pct,
+                    "timestral_q05_pct": float(lower) if np.isfinite(lower) else np.nan,
+                    "timestral_q95_pct": float(upper) if np.isfinite(upper) else np.nan,
+                    "interval_score_pct": interval_score,
+                    "directional_hit": hit,
+                }
+                aligned_contributions: dict[str, float] = {}
+                weights = weights_by_date.get(pd.Timestamp(date), {})
+                for pillar in self.pillar_names():
+                    if pillar not in date_scores.columns:
+                        continue
+                    value = pd.to_numeric(date_scores.at[ticker, pillar], errors="coerce")
+                    if np.isfinite(value):
+                        aligned_contributions[pillar] = float(value) * weights.get(pillar, 1.0) * np.sign(prediction)
+                record["largest_signal_aligned_pillar"] = (
+                    max(aligned_contributions, key=aligned_contributions.get)
+                    if aligned_contributions
+                    else ""
+                )
+                record["lower_tail_breach"] = bool(np.isfinite(lower) and actual_pct < float(lower))
+                records.append(record)
+
+        if not records:
+            self.feedback_cache[market] = empty
+            return empty
+
+        evaluated = pd.DataFrame(records)
+        directional = evaluated[evaluated["pred_alpha_z"].abs() >= 0.25]
+        reliability: dict[str, dict[str, float]] = {}
+        minimum_reliability = max(int(self.config.e("forecast_feedback.min_reliability_observations", 20)), 1)
+        max_discount = float(np.clip(self.config.e("forecast_feedback.max_reliability_discount", 0.25), 0.0, 0.75))
+        for ticker, group in directional.groupby("ticker", sort=False):
+            count = int(len(group))
+            hits = int(group["directional_hit"].sum())
+            posterior = float((hits + 1.0) / (count + 2.0))
+            multiplier = (
+                max(1.0 - max_discount, min(1.0, 2.0 * posterior))
+                if count >= minimum_reliability and posterior < 0.5
+                else 1.0
+            )
+            reliability[str(ticker)] = {
+                "observations": count,
+                "posterior_mean": posterior,
+                "multiplier": multiplier,
+            }
+            if count >= minimum_reliability:
+                self.calibration_rows.append(
+                    {
+                        "as_of_date": self.as_of,
+                        "scope": f"{market}:ticker:{ticker}",
+                        "parameter": "directional_reliability",
+                        "method": "beta_binomial_beta_1_1_nonoverlap",
+                        "value": posterior,
+                        "sample_size": count,
+                    }
+                )
+
+        interval_scores = evaluated["interval_score_pct"].dropna().to_numpy(dtype=float)
+        target_coverage = float(np.clip(self.config.e("forecast_feedback.conformal_target_coverage", 0.90), 0.5, 0.99))
+        min_conformal = max(int(self.config.e("forecast_feedback.min_conformal_samples", 100)), 1)
+        offset = 0.0
+        if interval_scores.size >= min_conformal:
+            order = min(
+                int(np.ceil((interval_scores.size + 1) * target_coverage)) - 1,
+                interval_scores.size - 1,
+            )
+            offset = max(float(np.partition(interval_scores, order)[order]), 0.0)
+        self.calibration_rows.append(
+            {
+                "as_of_date": self.as_of,
+                "scope": f"{market}:timestral_interval",
+                "parameter": "lower_upper_offset_pct",
+                "method": f"rolling_finite_sample_conformal_{target_coverage:.2f}_nonoverlap",
+                "value": offset,
+                "sample_size": int(interval_scores.size),
+            }
+        )
+
+        high_conviction = evaluated[
+            (evaluated["pred_alpha_z"].abs() >= 0.75)
+            & (
+                (evaluated["pred_alpha_z"] * evaluated["realized_z"] < 0.0)
+                | evaluated["lower_tail_breach"]
+            )
+        ].copy()
+        high_conviction = high_conviction.sort_values("pred_date", ascending=False).head(12)
+        recent_misses = [
+            {
+                "pred_date": row.pred_date.date().isoformat(),
+                "ticker": row.ticker,
+                "pred_alpha_z": round(float(row.pred_alpha_z), 3),
+                "realized_ret_pct": round(float(row.realized_ret_pct), 3),
+                "failure_mode": "TIMESTRAL_LOWER_TAIL_BREACH" if row.lower_tail_breach else "DIRECTIONAL_MISS",
+                "largest_signal_aligned_pillar": row.largest_signal_aligned_pillar,
+            }
+            for row in high_conviction.itertuples(index=False)
+        ]
+        result = {
+            "evaluations": int(len(evaluated)),
+            "directional_accuracy": (
+                float(directional["directional_hit"].mean()) if not directional.empty else None
+            ),
+            "reliability": reliability,
+            "conformal_offset_pct": offset,
+            "conformal_samples": int(interval_scores.size),
+            "recent_misses": recent_misses,
+        }
+        self.feedback_cache[market] = result
+        return result
+
+    def calibrate_timestral_intervals(self, market: str, forecasts: pd.DataFrame) -> pd.DataFrame:
+        """Widen q05/q95 by a matured empirical conformal offset, not a CVaR scale."""
+        if forecasts is None or forecasts.empty:
+            return pd.DataFrame() if forecasts is None else forecasts
+        frame = forecasts.copy()
+        if not bool(self.config.e("forecast_feedback.enabled", True)):
+            frame["timestral_q05_5d_raw_pct"] = frame.get("timestral_q05_5d_pct")
+            frame["timestral_q95_5d_raw_pct"] = frame.get("timestral_q95_5d_pct")
+            frame["timestral_q05_5d_calibrated_pct"] = frame.get("timestral_q05_5d_pct")
+            frame["timestral_q95_5d_calibrated_pct"] = frame.get("timestral_q95_5d_pct")
+            return frame
+        feedback = self._matured_forecast_feedback(market)
+        lower = pd.to_numeric(frame.get("timestral_q05_5d_pct"), errors="coerce")
+        upper = pd.to_numeric(frame.get("timestral_q95_5d_pct"), errors="coerce")
+        offset = float(feedback.get("conformal_offset_pct", 0.0))
+        frame["timestral_q05_5d_raw_pct"] = lower
+        frame["timestral_q95_5d_raw_pct"] = upper
+        frame["timestral_q05_5d_calibrated_pct"] = lower - offset
+        frame["timestral_q95_5d_calibrated_pct"] = upper + offset
+        return frame
+
+    def apply_matured_stock_reliability(self, market: str, alpha: pd.Series) -> tuple[pd.Series, int]:
+        """Apply only modest shrinkage for ticker histories with enough mature labels."""
+        if alpha.empty or not bool(self.config.e("forecast_feedback.enabled", True)):
+            return alpha, 0
+        feedback = self._matured_forecast_feedback(market)
+        reliability = feedback.get("reliability", {})
+        multipliers = pd.Series(
+            {
+                str(ticker): float(record.get("multiplier", 1.0))
+                for ticker, record in reliability.items()
+            },
+            dtype=float,
+        ).reindex(alpha.index).fillna(1.0)
+        adjusted = alpha * multipliers
+        return adjusted, int((multipliers < 1.0).sum())
+
     def _historical_ic_panels(
         self, market: str, *, pillars: Sequence[str] | None = None, max_dates: int = 120
     ) -> dict[str, list[Any]]:
@@ -995,6 +1264,32 @@ class V4AutonomousPortfolioReducer:
             return MarketRun(market, regime, 0, 0, pd.Series(dtype=float), pd.Series(dtype=float), [], diagnostics)
 
         alpha, ortho, fusion_diagnostics = self.fuse(market, factors, regime)
+        alpha, shrunk_tickers = self.apply_matured_stock_reliability(market, alpha)
+        feedback = self._matured_forecast_feedback(market)
+        low_reliability = sorted(
+            (
+                {
+                    "ticker": ticker,
+                    "observations": int(record["observations"]),
+                    "posterior_mean": round(float(record["posterior_mean"]), 3),
+                    "alpha_multiplier": round(float(record["multiplier"]), 3),
+                }
+                for ticker, record in feedback.get("reliability", {}).items()
+                if float(record.get("multiplier", 1.0)) < 1.0
+            ),
+            key=lambda item: item["posterior_mean"],
+        )[:10]
+        fusion_diagnostics["forecast_feedback"] = {
+            "matured_evaluations": int(feedback.get("evaluations", 0)),
+            "directional_accuracy": feedback.get("directional_accuracy"),
+            "nonoverlap_horizon_sessions": int(self.config.e("forecast_feedback.horizon_sessions", 5)),
+            "timestral_interval_offset_pct": round(float(feedback.get("conformal_offset_pct", 0.0)), 4),
+            "timestral_interval_samples": int(feedback.get("conformal_samples", 0)),
+            "stock_signals_shrunk": shrunk_tickers,
+            "low_reliability_names": low_reliability,
+            "recent_misses": feedback.get("recent_misses", []),
+            "attribution_method": "largest signal-aligned factor contribution; descriptive, not causal",
+        }
         diagnostics.update(fusion_diagnostics)
         diagnostics["regime"] = regime.regime_name
         diagnostics["turbulence_d2"] = float(regime.turbulence_d2)
@@ -1077,6 +1372,18 @@ class V4AutonomousPortfolioReducer:
         table["regime"] = regime.regime_name
         table["turbulence_d2"] = float(regime.turbulence_d2)
         table["cash_buffer"] = float(regime.cash_buffer)
+        forecasts = self.timestral_frames.get(market)
+        if forecasts is not None and not forecasts.empty:
+            forecasts = forecasts.reindex(table.index)
+            for source, destination in (
+                ("timestral_exp_ret_5d_pct", "timestral_exp_ret_5d_pct"),
+                ("timestral_q05_5d_raw_pct", "timestral_q05_5d_raw_pct"),
+                ("timestral_q95_5d_raw_pct", "timestral_q95_5d_raw_pct"),
+                ("timestral_q05_5d_calibrated_pct", "timestral_q05_5d_calibrated_pct"),
+                ("timestral_q95_5d_calibrated_pct", "timestral_q95_5d_calibrated_pct"),
+            ):
+                if source in forecasts.columns:
+                    table[destination] = forecasts[source]
         table = table.reset_index().rename(columns={"index": "ticker"})
         if "ticker" not in table.columns:
             table = table.rename(columns={table.columns[0]: "ticker"})
