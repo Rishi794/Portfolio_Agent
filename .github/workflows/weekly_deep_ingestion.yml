@@ -59,6 +59,13 @@ jobs:
           key: pms-deep-${{ matrix.market }}-${{ github.run_id }}
           restore-keys: pms-deep-${{ matrix.market }}-
 
+      - name: Restore prior lakehouse for historical PIT valuation
+        uses: actions/cache/restore@v6
+        with:
+          path: data_lake
+          key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: pms-lake-${{ github.ref_name }}-
+
       - name: Deep fundamentals + long OHLCV history shard
         env:
           SEC_USER_AGENT: "AutonomousPMS/4.0 (contact: rishichowdhury080@gmail.com)"
@@ -69,6 +76,7 @@ jobs:
             --shard-id ${{ matrix.shard }} \
             --total-shards 5 \
             --output-dir shards \
+            --lake-dir data_lake \
             --lookback-days 1500 \
             --backend onnx
 

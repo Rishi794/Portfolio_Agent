@@ -5,9 +5,9 @@ Sources (all free, no paid subscription):
 * Stooq daily CSV          — fallback for US symbols
 * NSE ``sec_bhavdata_full`` — full-day security-wise bhavcopy for India
 
-Splits/dividends: the Yahoo payload's ``adjclose`` is stored in ``adj_close``; the
-lakehouse keeps *raw* OHLCV and the engine consumes ``adj_close`` for returns so
-that historical returns are already split/dividend adjusted (no hardcoded factor).
+Splits/dividends: Yahoo's vendor ``adjclose`` is retained at ingestion, alongside
+raw OHLCV. At reducer read time, adjusted history is rebuilt from raw closes and
+point-in-time corporate actions so a warm delta still reflects newly learned actions.
 """
 
 from __future__ import annotations

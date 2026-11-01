@@ -186,6 +186,13 @@ fundamentals:
   nse_session_priming: true
   sec_requests_per_second: 8         # SEC fair-access policy
 
+# ---------------------------------------- historical price backfill ----------
+historical_ingestion:
+  min_bars_for_incremental: 512      # coverage target, not a hard model minimum
+  cold_start_calendar_days: 1825     # Yahoo 5y history on a missing/short panel
+  warm_delta_sessions: 5             # overlap the latest sessions to repair missed runs
+  max_india_official_refresh_sessions: 30
+
 # ------------------------------------------------ IC-IR factor weighting ---
 factor_learning:
   mode: ic_ir                       # 'ic_ir' (endogenous) | 'regime_prior'

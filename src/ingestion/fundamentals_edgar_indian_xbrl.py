@@ -67,6 +67,9 @@ US_TAG_MAP: dict[str, list[str]] = {
     "cash": ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
     "inventory": ["InventoryNet"],
 }
+US_FLOW_COLUMNS = frozenset(
+    {"revenue", "cogs", "depreciation", "sga", "net_income", "operating_cf", "ebit", "capex"}
+)
 
 ITEM1_PATTERNS = (
     re.compile(r"item\s*1[\.\s]*business", re.IGNORECASE),
@@ -90,7 +93,13 @@ def extract_pit_xbrl_tag(
     *,
     public_forms: tuple[str, ...] = ("10-K", "10-Q", "20-F"),
 ) -> pd.DataFrame:
-    """First-print (ticker, period_end, filing_timestamp, value) series for a tag."""
+    """First-print (period_end, filed_at, value) series for a tag.
+
+    CompanyFacts publishes a filing *date*, not an acceptance time. Until the
+    submission's exact ``acceptanceDateTime`` is joined by accession number, the
+    conservative fallback is midnight UTC on the following day, which cannot leak
+    an after-close filing into the filing date's decision.
+    """
     rows: list[dict[str, Any]] = []
     for tag in tag_candidates:
         node = us_gaap.get(tag)
@@ -102,10 +111,12 @@ def extract_pit_xbrl_tag(
             filed, end, value = item.get("filed"), item.get("end"), item.get("val")
             if not filed or not end or value is None:
                 continue
+            fallback_file_time = pd.Timestamp(filed, tz="UTC") + pd.Timedelta(days=1)
             rows.append(
                 {
                     "period_end": pd.to_datetime(end),
-                    "filing_timestamp": pd.to_datetime(f"{filed}T22:00:00Z", utc=True),
+                    "filing_timestamp": fallback_file_time,
+                    "accession_number": str(item.get("accn") or "").replace("-", ""),
                     "val": float(value),
                 }
             )
@@ -116,6 +127,121 @@ def extract_pit_xbrl_tag(
     frame = pd.DataFrame(rows).sort_values(["period_end", "filing_timestamp"])
     # PIT rule: the first public print of a period wins; restatements are ignored.
     return frame.drop_duplicates(subset=["period_end"], keep="first").reset_index(drop=True)
+
+
+def extract_pit_xbrl_quarterly_flow(
+    us_gaap: dict[str, Any],
+    tag_candidates: Iterable[str],
+    acceptance_by_accession: dict[str, pd.Timestamp],
+    unit: str = "USD",
+    *,
+    public_forms: tuple[str, ...] = ("10-K", "10-Q", "20-F"),
+) -> pd.DataFrame:
+    """Extract discrete quarterly flow values from SEC duration facts.
+
+    Prefer facts whose duration is a quarter. Where only a cumulative YTD or
+    annual fact exists, subtract the prior cumulative fact for the same fiscal
+    year and start date. If that subtraction cannot be supported, retain the
+    period with a missing value instead of treating YTD as a standalone quarter.
+    """
+    rows: list[dict[str, Any]] = []
+    for tag in tag_candidates:
+        node = us_gaap.get(tag)
+        if not node:
+            continue
+        for item in (node.get("units", {}) or {}).get(unit, []) or []:
+            filed, start, end, value = (
+                item.get("filed"), item.get("start"), item.get("end"), item.get("val")
+            )
+            if item.get("form") not in public_forms or not filed or not start or not end or value is None:
+                continue
+            try:
+                start_date = pd.Timestamp(start).normalize()
+                end_date = pd.Timestamp(end).normalize()
+                fallback = pd.Timestamp(filed, tz="UTC") + pd.Timedelta(days=1)
+                accession = str(item.get("accn") or "").replace("-", "")
+                rows.append(
+                    {
+                        "period_end": end_date,
+                        "start": start_date,
+                        "duration_days": int((end_date - start_date).days + 1),
+                        "filing_timestamp": acceptance_by_accession.get(accession, fallback),
+                        "accession_number": accession,
+                        "fy": item.get("fy"),
+                        "val": float(value),
+                    }
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if rows:
+            break
+    if not rows:
+        return pd.DataFrame(
+            columns=["period_end", "filing_timestamp", "accession_number", "val"]
+        )
+
+    facts = pd.DataFrame(rows).sort_values(["period_end", "filing_timestamp"])
+    quarterly: dict[pd.Timestamp, dict[str, Any]] = {}
+    cumulative: dict[tuple[str, pd.Timestamp], dict[str, Any]] = {}
+    for period_end, group in facts.groupby("period_end", sort=True):
+        direct = group[group["duration_days"].between(70, 110)].copy()
+        if not direct.empty:
+            direct["duration_distance"] = (direct["duration_days"] - 91).abs()
+            selected = direct.sort_values(
+                ["filing_timestamp", "duration_distance"], kind="stable"
+            ).iloc[0]
+            quarterly[pd.Timestamp(period_end)] = {
+                "period_end": pd.Timestamp(period_end),
+                "filing_timestamp": selected["filing_timestamp"],
+                "accession_number": selected["accession_number"],
+                "val": float(selected["val"]),
+            }
+
+        # Keep the longest same-period duration as the YTD anchor (Q1's 90-day
+        # fact is also its YTD anchor; later quarters can subtract it if a
+        # standalone quarter fact is absent).
+        accumulated = group[group["duration_days"].between(70, 400)]
+        if accumulated.empty:
+            continue
+        selected = accumulated.sort_values(
+            ["duration_days", "filing_timestamp"], ascending=[False, True], kind="stable"
+        ).iloc[0]
+        fiscal_year_value = selected["fy"]
+        fiscal_year = (
+            str(int(fiscal_year_value))
+            if pd.notna(fiscal_year_value)
+            else str(pd.Timestamp(selected["start"]).year)
+        )
+        cumulative[(fiscal_year, pd.Timestamp(period_end))] = selected.to_dict()
+
+    for (fiscal_year, period_end), selected in cumulative.items():
+        prior_rows = [
+            (prior_end, row)
+            for (prior_fy, prior_end), row in cumulative.items()
+            if prior_fy == fiscal_year
+            and prior_end < period_end
+            and pd.Timestamp(row["start"]) == pd.Timestamp(selected["start"])
+        ]
+        prior = max(prior_rows, key=lambda pair: pair[0])[1] if prior_rows else None
+        value = float("nan")
+        knowledge_time = selected["filing_timestamp"]
+        if prior is not None:
+            value = float(selected["val"]) - float(prior["val"])
+            knowledge_time = max(knowledge_time, prior["filing_timestamp"])
+        if period_end in quarterly:
+            continue
+        quarterly[period_end] = {
+            "period_end": period_end,
+            "filing_timestamp": knowledge_time,
+            "accession_number": selected["accession_number"],
+            "val": value,
+        }
+
+    if not quarterly:
+        return pd.DataFrame(
+            columns=["period_end", "filing_timestamp", "accession_number", "val"]
+        )
+    return pd.DataFrame(quarterly.values()).sort_values("period_end").reset_index(drop=True)
 
 
 class USEdgarFundamentalsParser:
@@ -134,7 +260,10 @@ class USEdgarFundamentalsParser:
         merged: pd.DataFrame | None = None
         for column, tags in US_TAG_MAP.items():
             unit = "shares" if column == "shares_out" else "USD"
-            extracted = extract_pit_xbrl_tag(us_gaap, tags, unit=unit)
+            if column in US_FLOW_COLUMNS:
+                extracted = extract_pit_xbrl_quarterly_flow(us_gaap, tags, {}, unit=unit)
+            else:
+                extracted = extract_pit_xbrl_tag(us_gaap, tags, unit=unit)
             if extracted.empty:
                 continue
             extracted = extracted.rename(columns={"val": column})
@@ -152,7 +281,79 @@ class USEdgarFundamentalsParser:
             return pd.DataFrame()
         return merged.sort_values("period_end").ffill().fillna(0.0)
 
-    def business_description(self, cik: int) -> str:
+    def statement_history_frame(self, facts: dict[str, Any], cik: int) -> pd.DataFrame:
+        """Join first-print facts while retaining the latest public timestamp per row."""
+        us_gaap = (facts.get("facts", {}) or {}).get("us-gaap", {}) or {}
+        try:
+            submissions = self.client.get_json(
+                f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"
+            )
+        except SourceUnavailable:
+            submissions = {}
+        recent = ((submissions.get("filings", {}) or {}).get("recent", {}) or {})
+        accessions = recent.get("accessionNumber", []) or []
+        acceptance_times = recent.get("acceptanceDateTime", []) or []
+        acceptance_by_accession: dict[str, pd.Timestamp] = {}
+        for accession, accepted in zip(accessions, acceptance_times):
+            if not accession or not accepted:
+                continue
+            stamp = pd.to_datetime(accepted, utc=True, errors="coerce")
+            if pd.notna(stamp):
+                acceptance_by_accession[str(accession).replace("-", "")] = stamp
+
+        merged: pd.DataFrame | None = None
+        filed_columns: list[str] = []
+        for column, tags in US_TAG_MAP.items():
+            unit = "shares" if column == "shares_out" else "USD"
+            if column in US_FLOW_COLUMNS:
+                extracted = extract_pit_xbrl_quarterly_flow(
+                    us_gaap, tags, acceptance_by_accession, unit=unit
+                )
+            else:
+                extracted = extract_pit_xbrl_tag(us_gaap, tags, unit=unit)
+            if extracted.empty:
+                continue
+            filed_column = f"{column}__filed_at"
+            filed_columns.append(filed_column)
+            extracted["filing_timestamp"] = [
+                acceptance_by_accession.get(accession, fallback)
+                for accession, fallback in zip(
+                    extracted["accession_number"], extracted["filing_timestamp"]
+                )
+            ]
+            extracted = extracted.rename(
+                columns={"val": column, "filing_timestamp": filed_column}
+            )
+            if merged is None:
+                merged = extracted[["period_end", column, filed_column]]
+                continue
+            right = extracted[["period_end", column, filed_column]].sort_values("period_end")
+            merged = pd.merge_asof(
+                merged.sort_values("period_end"),
+                right,
+                on="period_end",
+                direction="nearest",
+                tolerance=pd.Timedelta("20D"),
+            )
+        if merged is None or merged.empty:
+            return pd.DataFrame()
+
+        # A row only becomes usable once all values it uses, including carried
+        # values from older periods, were public. Carry the per-column knowledge
+        # timestamps alongside the values before taking the row-level maximum.
+        merged = merged.sort_values("period_end").reset_index(drop=True)
+        value_columns = [column for column in US_TAG_MAP if column in merged.columns]
+        for column in value_columns:
+            filed_column = f"{column}__filed_at"
+            merged[[column, filed_column]] = merged[[column, filed_column]].ffill()
+        merged["filing_timestamp"] = merged[filed_columns].max(axis=1)
+        return merged.dropna(subset=["filing_timestamp"]).drop_duplicates(
+            subset=["period_end"], keep="last"
+        ).reset_index(drop=True)
+
+    def business_description(
+        self, cik: int, *, as_of: pd.Timestamp | None = None
+    ) -> str:
         """10-K Item 1 (Business) text, used as the company's policy-matching vector."""
         try:
             submissions = self.client.get_json(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json")
@@ -162,11 +363,31 @@ class USEdgarFundamentalsParser:
         forms = recent.get("form", []) or []
         accession = recent.get("accessionNumber", []) or []
         documents = recent.get("primaryDocument", []) or []
+        filing_dates = recent.get("filingDate", []) or []
+        acceptance_times = recent.get("acceptanceDateTime", []) or []
+        cutoff = None
+        if as_of is not None:
+            cutoff = pd.Timestamp(as_of)
+            cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
         for idx, form in enumerate(forms):
             if form not in ("10-K", "20-F"):
                 continue
             if idx >= len(accession) or idx >= len(documents):
                 continue
+            if cutoff is not None:
+                if idx >= len(filing_dates):
+                    continue
+                accepted = acceptance_times[idx] if idx < len(acceptance_times) else None
+                knowledge_time = pd.to_datetime(accepted, errors="coerce", utc=True)
+                if pd.isna(knowledge_time):
+                    filing_day = pd.to_datetime(filing_dates[idx], errors="coerce", utc=True)
+                    if pd.isna(filing_day):
+                        continue
+                    # Company submissions do not always include acceptance times.
+                    # The next-day fallback is intentionally conservative.
+                    knowledge_time = filing_day.normalize() + pd.Timedelta(days=1)
+                if knowledge_time > cutoff:
+                    continue
             accession_nodash = str(accession[idx]).replace("-", "")
             url = (
                 f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_nodash}/"
@@ -181,6 +402,141 @@ class USEdgarFundamentalsParser:
             if extracted:
                 return extracted[: self.max_business_chars]
         return ""
+
+    def parse_history(
+        self,
+        ticker: str,
+        cik: int,
+        *,
+        sector: str = "UNKNOWN",
+        close_wide: pd.DataFrame | None = None,
+        raw_close_wide: pd.DataFrame | None = None,
+        volume_wide: pd.DataFrame | None = None,
+        market_returns: pd.Series | None = None,
+        risk_free: float = 0.04,
+        as_of: pd.Timestamp | None = None,
+        history_years: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Emit distinct SEC-known statement snapshots for leakage-free replay."""
+        try:
+            facts = self.company_facts(cik)
+        except SourceUnavailable:
+            return []
+        statements = self.statement_history_frame(facts, cik)
+        if len(statements) < 2:
+            return []
+
+        cutoff = pd.Timestamp(as_of or dt.datetime.now(dt.timezone.utc))
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        earliest_period = cutoff.tz_localize(None) - pd.DateOffset(years=max(int(history_years), 1))
+        statements = statements.copy()
+        statements["filing_timestamp"] = pd.to_datetime(
+            statements["filing_timestamp"], utc=True, errors="coerce"
+        )
+        statements["period_end"] = pd.to_datetime(
+            statements["period_end"], utc=True, errors="coerce"
+        ).dt.tz_convert(None).dt.normalize()
+        statements = statements[
+            (statements["period_end"] >= earliest_period)
+            & (statements["filing_timestamp"] <= cutoff)
+        ]
+        if len(statements) < 2:
+            return []
+
+        snapshots: list[dict[str, Any]] = []
+        stamps = sorted(statements["filing_timestamp"].dropna().unique())
+        wacc_cfg = self.config.e("optimizer.wacc", {}) or {}
+        history_close = _date_indexed_panel(close_wide)
+        raw_history_close = _date_indexed_panel(raw_close_wide)
+        history_volume = _date_indexed_panel(volume_wide)
+        market_history = _date_indexed_series(market_returns)
+        for raw_stamp in stamps:
+            stamp = pd.Timestamp(raw_stamp).tz_convert("UTC")
+            known = statements[
+                statements["filing_timestamp"] <= stamp
+            ].sort_values("period_end")
+            if len(known) < 2:
+                continue
+            current = known.iloc[-1]
+            period_end = pd.Timestamp(current["period_end"])
+            # Price-based quantities are marked using the latest fully completed
+            # session before disclosure. Excluding the disclosure-date bar avoids
+            # assuming a decision could use a close that was not yet available.
+            price_cutoff = stamp.tz_localize(None).normalize()
+            series = pd.Series(dtype=float)
+            market_series = pd.Series(dtype=float)
+            if not history_close.empty and ticker in history_close.columns:
+                series = pd.to_numeric(
+                    history_close.loc[history_close.index < price_cutoff, ticker], errors="coerce"
+                ).dropna()
+            if not market_history.empty:
+                market_series = market_history[market_history.index < price_cutoff].dropna()
+            stock_returns = series.pct_change(fill_method=None).dropna()
+            beta = (
+                self.engine.beta_from_returns(stock_returns, market_series)
+                if not stock_returns.empty and not market_series.empty
+                else 1.0
+            )
+            raw_series = pd.Series(dtype=float)
+            if not raw_history_close.empty and ticker in raw_history_close.columns:
+                raw_series = pd.to_numeric(
+                    raw_history_close.loc[raw_history_close.index < price_cutoff, ticker],
+                    errors="coerce",
+                ).dropna()
+            price = float(raw_series.iloc[-1]) if not raw_series.empty else float("nan")
+            dollar_volume = float("nan")
+            if (
+                not raw_series.empty
+                and not history_volume.empty
+                and ticker in history_volume.columns
+            ):
+                volume_series = pd.to_numeric(
+                    history_volume.loc[history_volume.index < price_cutoff, ticker],
+                    errors="coerce",
+                )
+                aligned_volume = volume_series.reindex(raw_series.index).dropna()
+                aligned_price = raw_series.reindex(aligned_volume.index)
+                if not aligned_volume.empty:
+                    dollar_volume = float((aligned_price * aligned_volume).tail(20).mean())
+            shares = float(current.get("shares_out", 0.0) or 0.0)
+            market_cap = price * shares if np.isfinite(price) and shares > 0 else float("nan")
+            cash = float(current.get("cash", 0.0) or 0.0)
+            statement_values = known.drop(
+                columns=[
+                    column
+                    for column in known.columns
+                    if column == "filing_timestamp" or column.endswith("__filed_at")
+                ],
+                errors="ignore",
+            )
+            metrics = compute_forensic_metrics(
+                statement_values,
+                beta=beta,
+                risk_free=risk_free,
+                equity_risk_premium=float(wacc_cfg.get("equity_risk_premium", 0.045)),
+                effective_tax_rate=float(wacc_cfg.get("effective_tax_rate", 0.25)),
+                min_wacc=float(wacc_cfg.get("min_wacc", 0.06)),
+                max_wacc=float(wacc_cfg.get("max_wacc", 0.18)),
+                market_cap=market_cap,
+                cash=cash,
+            )
+            description = self.business_description(cik, as_of=stamp)
+            row = {
+                "ticker": ticker,
+                "market": "US",
+                "fiscal_period": str(period_end.date()),
+                "filing_timestamp": stamp,
+                "gics_sector": sector,
+                "beta": round(float(beta), 4),
+                "dollar_volume_20d": dollar_volume,
+                "promoter_holding_pct": float("nan"),
+                "promoter_pledge_pct": 0.0,
+                "institutional_flow_delta": 0.0,
+                "business_description": _business_text(ticker, sector, description),
+            }
+            row.update(detail_to_json(metrics))
+            snapshots.append(row)
+        return snapshots
 
     def parse(
         self,
@@ -471,27 +827,61 @@ def _parse_broadcast_timestamp(value: Any) -> pd.Timestamp | None:
 # --------------------------------------------------------------------------- #
 # price panel helper + CLI
 # --------------------------------------------------------------------------- #
-def load_price_panel(lake_dir: str | Path, market: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
-    """(close_wide, volume_wide, market_returns) from the local lakehouse if present."""
+def load_price_panel(
+    lake_dir: str | Path,
+    market: str,
+    *,
+    include_raw_close: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series] | tuple[
+    pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame
+]:
+    """(adjusted close, volume, market returns), optionally with raw closes."""
     path = Path(lake_dir) / "market_prices.parquet"
     if not path.exists():
         empty = pd.DataFrame()
-        return empty, empty, pd.Series(dtype=float)
+        result = (empty, empty, pd.Series(dtype=float))
+        return (*result, empty) if include_raw_close else result
     frame = pd.read_parquet(path)
     frame = frame[frame["market"].astype(str) == market]
     if frame.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
+        empty = pd.DataFrame()
+        result = (empty, empty, pd.Series(dtype=float))
+        return (*result, empty) if include_raw_close else result
     frame["date"] = pd.to_datetime(frame["date"])
     close_column = "adj_close" if "adj_close" in frame.columns else "close"
     close_wide = frame.pivot_table(index="date", columns="ticker", values=close_column, aggfunc="last").sort_index()
     volume_wide = frame.pivot_table(index="date", columns="ticker", values="volume", aggfunc="last").sort_index()
     benchmark = frame.groupby("date")[close_column].mean()
     market_returns = benchmark.pct_change(fill_method=None).dropna()
-    return close_wide, volume_wide, market_returns
+    result = (close_wide, volume_wide, market_returns)
+    if not include_raw_close:
+        return result
+    raw_close_wide = frame.pivot_table(
+        index="date", columns="ticker", values="close", aggfunc="last"
+    ).sort_index()
+    return (*result, raw_close_wide)
 
 
 def union_price_panel(lake_dir: str | Path, market: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     return load_price_panel(lake_dir, market)
+
+
+def _date_indexed_panel(frame: pd.DataFrame | None) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    out = frame.copy()
+    index = pd.DatetimeIndex(pd.to_datetime(out.index, errors="coerce", utc=True).tz_convert(None))
+    out.index = index.normalize()
+    return out.sort_index()
+
+
+def _date_indexed_series(series: pd.Series | None) -> pd.Series:
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+    out = pd.to_numeric(series, errors="coerce").copy()
+    index = pd.DatetimeIndex(pd.to_datetime(out.index, errors="coerce", utc=True).tz_convert(None))
+    out.index = index.normalize()
+    return out.sort_index()
 
 
 def main(argv: list[str] | None = None) -> int:

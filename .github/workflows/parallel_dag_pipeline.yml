@@ -123,9 +123,20 @@ jobs:
         market: ${{ fromJSON(needs.prepare.outputs.market_matrix) }}
         shard: [0, 1, 2, 3, 4]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
+
+      # Coverage comes from the previous fan-in commit. If no manifest exists yet,
+      # the worker safely treats its symbols as cold-start and pulls full history.
+      - name: Checkout prior historical coverage manifest
+        uses: actions/checkout@v7
+        continue-on-error: true
+        with:
+          ref: data-state
+          path: prior_state
+          sparse-checkout: historical_coverage.json
+          sparse-checkout-cone-mode: false
 
       - uses: astral-sh/setup-uv@v10.3.0
         with:
@@ -159,6 +170,13 @@ jobs:
           key: pms-onnx-bge-v1
           restore-keys: pms-onnx-bge-
 
+      - name: Restore prior lakehouse for historical PIT valuation
+        uses: actions/cache/restore@v6
+        with:
+          path: data_lake
+          key: pms-lake-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: pms-lake-${{ github.ref_name }}-
+
       - name: Ingest company shard
         env:
           # SEC answers 403 to generic User-Agents; a real contact address is
@@ -172,7 +190,9 @@ jobs:
             --shard-id ${{ matrix.shard }} \
             --total-shards 5 \
             --output-dir shards \
-            --lookback-days 420
+            --lake-dir data_lake \
+            --lookback-days 5 \
+            --coverage-manifest prior_state/historical_coverage.json
 
       - name: Golden-copy quorum shard (3 independent feeds per market)
         env:
@@ -260,7 +280,7 @@ jobs:
       needs.company-shards.result != 'cancelled' &&
       needs.domain-shards.result != 'cancelled'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:

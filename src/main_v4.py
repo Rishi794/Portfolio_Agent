@@ -45,6 +45,7 @@ from .filtering.statistics import sector_zscore, winsorize, zscore
 from .filtering.timestral_forecaster import TIMESTRAL_PILLAR, TimestralForecastEngine
 from .portfolio.hrp_optimizer import HRPOptimizer
 from .ingestion.nse_bse_bhavcopy_corporate_actions import adjust_for_actions
+from .ingestion.history_coverage import write_history_coverage_manifest
 from .state.ledger import Ledger
 from .storage.lakehouse import Lakehouse, manifest_row
 
@@ -63,10 +64,9 @@ SHARD_ROUTES: dict[str, str] = {
 }
 
 # Market data is a *vendor-derived* feed, not a public print: re-ingesting the same
-# (ticker, date) must refresh ``adj_close`` (Yahoo re-adjusts for later splits).
-# PIT discipline for prices is enforced at *read* time instead: ``price_snapshot``
-# only exposes rows whose ``knowledge_timestamp`` <= as_of. Fundamental/macro prints
-# keep first-print-wins semantics.
+# (ticker, date) refreshes raw OHLCV. PIT discipline for prices is enforced at read
+# time; the reducer rebuilds adjusted prices from the raw close and only those actions
+# known by ``as_of``. Fundamental/macro prints keep first-print-wins semantics.
 LATEST_WINS_TABLES = {"market_prices", "corporate_actions", "policy_geopol_events", "spillover_us_india"}
 
 
@@ -123,21 +123,23 @@ class V4AutonomousPortfolioReducer:
     # ===================================================================== ingest
     def ingest_shards(self) -> dict[str, int]:
         written: dict[str, int] = {}
-        if not self.shards_dir or not self.shards_dir.exists():
-            return written
-        for path in sorted(self.shards_dir.glob("*.parquet")):
-            stem = path.stem
-            route = next((table for prefix, table in SHARD_ROUTES.items() if stem.startswith(prefix)), None)
-            if route is None:
-                continue
-            frame = pd.read_parquet(path)
-            if frame.empty:
-                continue
-            if "market" not in frame.columns and route in {"market_prices", "fundamentals_pit", "corporate_actions"}:
-                market = "INDIA" if "india" in stem else "US"
-                frame = frame.assign(market=market)
-            count = self.lake.write(route, frame, enforce_pit=route not in LATEST_WINS_TABLES)
-            written[route] = written.get(route, 0) + count
+        if self.shards_dir and self.shards_dir.exists():
+            for path in sorted(self.shards_dir.glob("*.parquet")):
+                stem = path.stem
+                route = next((table for prefix, table in SHARD_ROUTES.items() if stem.startswith(prefix)), None)
+                if route is None:
+                    continue
+                frame = pd.read_parquet(path)
+                if frame.empty:
+                    continue
+                if "market" not in frame.columns and route in {"market_prices", "fundamentals_pit", "corporate_actions"}:
+                    market = "INDIA" if "india" in stem else "US"
+                    frame = frame.assign(market=market)
+                count = self.lake.write(route, frame, enforce_pit=route not in LATEST_WINS_TABLES)
+                written[route] = written.get(route, 0) + count
+        write_history_coverage_manifest(
+            self.lake.read("market_prices"), self.state_dir / "historical_coverage.json"
+        )
         return written
 
     # ====================================================================== view
@@ -151,23 +153,16 @@ class V4AutonomousPortfolioReducer:
         frame["date"] = pd.to_datetime(frame["date"])
         frame = frame[pd.to_datetime(frame["knowledge_timestamp"], utc=True) <= self.as_of_utc_cutoff]
         frame = frame[frame["date"] <= self.as_of]
-        frame["adj_close"] = pd.to_numeric(frame.get("adj_close"), errors="coerce").fillna(
-            pd.to_numeric(frame["close"], errors="coerce")
-        )
         frame = frame.sort_values(["ticker", "date"]).drop_duplicates(subset=["ticker", "date"], keep="last")
-        # NSE UDiFF rows are raw. Rebuild adjusted history at the requested as-of
-        # date using only actions whose ex-date and observation time are known then.
-        # Yahoo's adj_close already includes its corporate-action adjustment and
-        # must never be passed through this transformation again.
-        raw_nse = frame.get("price_source", pd.Series(index=frame.index, dtype="object")).eq("NSE_UDIFF")
-        if raw_nse.any():
-            actions = self.lake.read("corporate_actions")
-            if not actions.empty:
-                actions = actions[actions["market"].astype(str) == market]
-            adjusted = adjust_for_actions(frame.loc[raw_nse], actions, as_of=self.as_of_utc_cutoff)
-            columns = [column for column in ("open", "high", "low", "adj_close", "volume", "dollar_volume") if column in adjusted]
-            frame.loc[adjusted.index, columns] = adjusted[columns]
-        return frame
+        # Rebuild adjusted prices from raw closes and the full action table each
+        # run. Yahoo's stored adj_close is vendor-restated; warm price deltas do not
+        # refresh five years of those values after a split or dividend. Recomputing
+        # avoids double-adjusting vendor data and honors action knowledge time.
+        actions = self.lake.read("corporate_actions")
+        if not actions.empty:
+            actions = actions[actions["market"].astype(str) == market]
+        frame["adj_close"] = pd.to_numeric(frame["close"], errors="coerce")
+        return adjust_for_actions(frame, actions, as_of=self.as_of_utc_cutoff)
 
     def close_wide(self, market: str) -> pd.DataFrame:
         frame = self.price_snapshot(market)
