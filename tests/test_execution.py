@@ -82,12 +82,12 @@ def test_custom_fills_override_shares_and_price(tmp_path: Path) -> None:
         [{"market": "US", "action": "BUY", "ticker": "AAPL", "shares": 10, "ref_price": 100.0,
           "est_cost_bps": 3.0, "sector": "Technology"}],
     )
-    result = apply_approved_orders(state, "/approve AAPL=12@95.5", 7, "owner", tmp_path / "r.md")
+    result = apply_approved_orders(state, "/approve AAPL=8@95.5", 7, "owner", tmp_path / "r.md")
     assert result["orders"] == 1
     position = Ledger(state, "US").load()["positions"]["AAPL"]
-    assert position["shares"] == pytest.approx(12.0)
-    fee = 12 * 95.5 * 3.0 / 10_000.0
-    assert position["avg_cost"] == pytest.approx((12 * 95.5 + fee) / 12, abs=1e-6)
+    assert position["shares"] == pytest.approx(8.0)
+    fee = 8 * 95.5 * 3.0 / 10_000.0
+    assert position["avg_cost"] == pytest.approx((8 * 95.5 + fee) / 8, abs=1e-6)
     assert position["last_price"] == pytest.approx(95.5)
 
 
@@ -167,3 +167,76 @@ def test_no_pending_files_is_a_noop(tmp_path: Path) -> None:
     result = apply_approved_orders(state, "/approve", 3, "owner", tmp_path / "r.md")
     assert result["status"] == "no_pending_files"
     assert "No `pending_orders" in (tmp_path / "r.md").read_text(encoding="utf-8")
+
+
+def test_approval_refuses_pending_queue_from_another_issue_run(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_us_book(state, cash=1_000.0)
+    (state / "pending_orders_us.json").write_text(
+        json.dumps(
+            {
+                "market": "US",
+                "run_id": "new-run-20261101",
+                "orders": [
+                    {"action": "BUY", "ticker": "AAPL", "shares": 1, "ref_price": 100.0, "est_cost_bps": 3.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = apply_approved_orders(
+        state,
+        "/approve",
+        12,
+        "owner",
+        tmp_path / "stale.md",
+        expected_run_id="old-run-20261031",
+    )
+
+    assert result["status"] == "stale_run"
+    assert Ledger(state, "US").load()["positions"] == {}
+    assert json.loads((state / "pending_orders_us.json").read_text())["orders"]
+    assert "Approval refused" in (tmp_path / "stale.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("custom_fill", ["AAPL=20@20", "AAPL=10@51"])
+def test_custom_fill_cannot_exceed_approved_quantity_or_adv_notional(
+    tmp_path: Path, custom_fill: str
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_us_book(state, cash=10_000.0)
+    (state / "pending_orders_us.json").write_text(
+        json.dumps(
+            {
+                "market": "US",
+                "run_id": "run-1",
+                "orders": [
+                    {
+                        "action": "BUY",
+                        "ticker": "AAPL",
+                        "shares": 10,
+                        "ref_price": 50.0,
+                        "compliance_max_notional": 500.0,
+                        "est_cost_bps": 3.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = apply_approved_orders(
+        state,
+        f"/approve {custom_fill}",
+        21,
+        "owner",
+        tmp_path / "receipt.md",
+        expected_run_id="run-1",
+    )
+
+    assert result["orders"] == 0
+    assert Ledger(state, "US").load()["positions"] == {}
+    assert "SKIP" in (tmp_path / "receipt.md").read_text(encoding="utf-8")

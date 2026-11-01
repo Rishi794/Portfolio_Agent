@@ -117,6 +117,13 @@ def test_issue_and_dashboard_render(e2e: dict, config, tmp_path: Path) -> None:
     assert "Synthetic demo run" in body
     assert "## Approval" in body and "/approve" in body
     assert "US" in body and "INDIA" in body
+    for run in summary["runs"]:
+        if run["targets"]:
+            assert f"| # | Ticker | Target wt | α (ortho) |" in body
+            assert any(f"`{ticker}`" in body for ticker in run["targets"])
+    if any(run["tickets"] for run in summary["runs"]):
+        assert "Pending orders (await approval)" in body
+        assert any(ticket["ticker"] in body for run in summary["runs"] for ticket in run["tickets"])
 
     html_path = build_dashboard_html(e2e["state_dir"], tmp_path / "index.html")
     html = html_path.read_text(encoding="utf-8")
@@ -139,7 +146,7 @@ def test_v5_open_aladdin_layer_and_dashboard(e2e: dict, config, tmp_path: Path) 
     telemetry = pipeline.process(e2e["summary"])
 
     assert (e2e["state_dir"] / "risk_attribution.json").exists()
-    assert len(telemetry["merkle_state_hash"]) == 64
+    assert len(telemetry["telemetry_sha256"]) == 64
     for market in ("US", "INDIA"):
         info = telemetry["markets"][market]
         assert info["port_ann_vol_pct"] >= 0.0

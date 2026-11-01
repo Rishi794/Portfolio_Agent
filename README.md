@@ -5,7 +5,8 @@ lakehouse, self-calibrating estimators, $0 runtime on GitHub Actions.**
 
 V5 adds the **Open-Aladdin verification layer**: a 3-source golden-copy Byzantine
 quorum (median consensus + Hampel MAD flash-crash quarantine, SHA-256 proof per
-bar), fixed-point `Decimal` double-entry IBOR with a balanced-journal invariant,
+bar), a fixed-point `Decimal` double-entry IBOR reference model used by the
+invariant gate, plus Decimal reconciliation of the production ledger snapshot,
 exact **Euler risk attribution** (`Σ CCTR ≡ σ_p`), fat-tailed Student-t `CVaR@99%`,
 market-driven scenario stress tests (`B = Σ_RF Σ_F⁻¹`) and a pre-trade compliance
 gate (quarantine blocks + 5%-of-ADV liquidity cap) — all proven by a formal
@@ -13,7 +14,7 @@ invariant test gate that must pass before any Issue or dashboard is published.
 
 No paid data, no servers, no cron VPS. The whole system runs on free GitHub-hosted
 runners, stores its feature store as Parquet on a rolling GitHub Release, keeps its
-event-sourced portfolio ledger on an orphan `data-state` branch, and publishes a
+portfolio snapshots with an append-only audit journal on an orphan `data-state` branch, and publishes a
 Plotly dashboard to GitHub Pages.
 
 > ⚠️ **This is quantitative research infrastructure, not investment advice.** Trades
@@ -225,7 +226,7 @@ config/            engine.yaml (all priors/statutory constants), universe.yaml,
 src/config.py      dotted-path config + fingerprint
 src/storage/       schemas.py (table specs), lakehouse.py (PIT upsert + DuckDB),
                    verify_parquet.py (required tables + integrity, exit 1 on failure)
-src/state/         ledger.py (event-sourced snapshots + pending queues)
+src/state/         ledger.py (operational snapshots + append-only audit journal + pending queues)
 src/ingestion/     base (retry/cache/offline), universe, market_data, macro_fred_pit,
                    policy_federal_register, policy_india, geopolitics_gdelt,
                    fundamentals_edgar_indian_xbrl, tech_patents_openalex,
@@ -283,11 +284,11 @@ scripts/           bootstrap_state_branch.sh, run_local_demo.sh
   similarity reflects token overlap. The FDR machinery still operates exactly; the
   only degradation is embedding quality.
 * **Golden-copy quorum feeds** — INDIA: NSE UDiFF bhavcopy (official, carries the
-  ISIN) + BSE UDiFF bhavcopy (cross-matched by ISIN, Yahoo `.BO` fallback) +
-  Yahoo `.NS`; US: Tiingo IEX (key optional) + Stooq + Yahoo. Only when a single
-  vendor answers is its print mirrored as `PRIMARY_EXCHANGE_CLOSE` so the 2-of-3
-  floor is met (same value, tracked via `sources_agreed` — never a silent
-  fabrication). Vendors diverging by more than `aladdin.quorum.max_source_divergence_bps`
+  ISIN) + BSE UDiFF bhavcopy (cross-matched by ISIN) + Yahoo `.NS`; US: Tiingo
+  IEX (key optional) + Stooq + Yahoo. Yahoo's `.BO` and `.NS` listings are one
+  provider, so they cannot provide two independent quorum votes. Only when a single
+  independent vendor answers, the bar is dropped; the system never mirrors a
+  print to fake quorum. Vendors diverging by more than `aladdin.quorum.max_source_divergence_bps`
   (5 bps) quarantine the bar; an unexplained 8-σ Hampel MAD spike quarantines it as
   a flash-crash candidate. Quarantined tickers can be SOLD but never BOUGHT
   (pre-trade compliance gate), and every bar carries a SHA-256 proof hash.

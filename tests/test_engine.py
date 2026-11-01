@@ -172,3 +172,15 @@ def test_event_half_life_degrades_gracefully_without_events(config) -> None:
     empty = pd.DataFrame(columns=["event_id", "domain", "published_timestamp"])
     result = engine.learn_event_half_life(empty, pd.DataFrame(), pd.Series(dtype=float), domain="GOV_POLICY")
     assert not np.isfinite(result["half_life_days"])
+
+
+def test_rolling_ic_ir_constant_factor_is_zero_without_nan(config) -> None:
+    engine = SelfCalibratingQuantEngine(config)
+    index = pd.Index([f"T{i}" for i in range(20)])
+    factors = pd.DataFrame({"constant": np.ones(len(index)), "varying": np.arange(len(index))}, index=index)
+    forward = pd.Series(np.arange(len(index), dtype=float), index=index)
+
+    result = engine.learn_rolling_ic_ir_factor_weights([factors] * 6, [forward] * 6)
+
+    assert np.isfinite(result["weights"]).all()
+    assert result["ic_mean"][0] == 0.0

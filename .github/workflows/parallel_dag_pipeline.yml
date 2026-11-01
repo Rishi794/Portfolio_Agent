@@ -344,7 +344,9 @@ jobs:
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file issue_body.md
+            # The run id in the issue body binds /approve to the matching pending
+            # queue. Updating the body keeps same-day reruns on the current run.
+            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file issue_body.md
             echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \

@@ -50,15 +50,18 @@ def _action(**overrides: object) -> pd.DataFrame:
 def test_fractional_split_back_adjusts_int64_bhavcopy_columns() -> None:
     adjusted = adjust_for_actions(_prices(), _action())
 
-    assert adjusted.loc[0, "close"] == pytest.approx(2941 / 1.5)
+    # Reported close remains suitable for execution price display. The adjusted
+    # close and OHLC are on the post-split share basis for return calculations.
+    assert adjusted.loc[0, "close"] == pytest.approx(2941.0)
+    assert adjusted.loc[0, "adj_close"] == pytest.approx(2941 / 1.5)
     assert adjusted.loc[0, "volume"] == pytest.approx(1001 * 1.5)
     # Post-ex-date rows stay exactly as traded.
     assert adjusted.loc[1, "close"] == pytest.approx(2905.0)
     assert adjusted.loc[1, "volume"] == pytest.approx(1500.0)
     # Touched columns are float64 so no later fractional assignment can fail.
     assert all(adjusted[column].dtype == "float64" for column in ("close", "adj_close", "volume"))
-    # Dollar volume is rebuilt from the adjusted series.
-    assert adjusted.loc[0, "dollar_volume"] == pytest.approx((2941 / 1.5) * (1001 * 1.5))
+    # Dollar volume remains actual historical turnover and is split invariant.
+    assert adjusted.loc[0, "dollar_volume"] == pytest.approx(2941 * 1001)
 
 
 def test_dividend_only_touches_adj_close_before_ex_date() -> None:
@@ -69,6 +72,37 @@ def test_dividend_only_touches_adj_close_before_ex_date() -> None:
     assert adjusted.loc[0, "close"] == pytest.approx(2941.0)
     assert adjusted.loc[1, "adj_close"] == pytest.approx(2905.0)
     assert adjusted.loc[0, "volume"] == pytest.approx(1001.0)
+
+
+def test_dividend_adjustment_is_proportional_across_history() -> None:
+    prices = pd.DataFrame(
+        {
+            "ticker": [TICKER] * 3,
+            "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-05"]),
+            "open": [99.0, 109.0, 104.0],
+            "high": [101.0, 111.0, 106.0],
+            "low": [98.0, 108.0, 103.0],
+            "close": [100.0, 110.0, 105.0],
+            "adj_close": [100.0, 110.0, 105.0],
+            "volume": [10.0, 10.0, 10.0],
+        }
+    )
+    adjusted = adjust_for_actions(prices, _action(action_type="DIVIDEND", split_ratio=1.0, cash_dividend=5.0))
+    multiplier = (110.0 - 5.0) / 110.0
+
+    assert adjusted.loc[0, "adj_close"] == pytest.approx(100.0 * multiplier)
+    assert adjusted.loc[1, "adj_close"] == pytest.approx(110.0 * multiplier)
+    assert adjusted.loc[0, "close"] == pytest.approx(100.0)
+    assert adjusted.loc[2, "adj_close"] == pytest.approx(105.0)
+
+
+def test_actions_are_filtered_to_as_of_date_and_knowledge_time() -> None:
+    action = _action().assign(knowledge_timestamp=pd.Timestamp("2026-01-06", tz="UTC"))
+    before_ex_date = adjust_for_actions(_prices(), action, as_of=pd.Timestamp("2026-01-04", tz="UTC"))
+    before_announcement = adjust_for_actions(_prices(), action, as_of=pd.Timestamp("2026-01-05", tz="UTC"))
+
+    assert before_ex_date.loc[0, "adj_close"] == pytest.approx(2941.0)
+    assert before_announcement.loc[0, "adj_close"] == pytest.approx(2941.0)
 
 
 def test_no_actions_still_recomputes_dollar_volume() -> None:

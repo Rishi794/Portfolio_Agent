@@ -473,7 +473,7 @@ class AladdinRiskAndScenarioEngine:
         adv_20d_map: dict[str, float],
         max_adv_participation: float = 0.05,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Block quarantined BUYs; scale any order above the ADV participation cap.
+        """Fail closed on unverified BUYs and unknown liquidity; enforce the ADV cap.
 
         Returns ``(approved, rejected_or_scaled)``. Orders whose notional is below
         the cap pass through untouched apart from an ``est_notional`` stamp.
@@ -482,21 +482,38 @@ class AladdinRiskAndScenarioEngine:
         rejected: list[dict[str, Any]] = []
 
         for order in proposed_orders:
-            ticker = order["ticker"]
+            ticker = str(order.get("ticker", ""))
             action = str(order.get("action", "")).upper()
-            status = golden_status_map.get(ticker, "VERIFIED_GOLDEN")
-            if status != "VERIFIED_GOLDEN" and action == "BUY":
-                rejected.append({**order, "compliance_reason": f"BLOCKED: {status}"})
+            if not ticker or action not in {"BUY", "SELL"}:
+                rejected.append({**order, "compliance_reason": "BLOCKED: invalid order identity or action"})
+                continue
+
+            status = golden_status_map.get(ticker)
+            if action == "BUY" and status != "VERIFIED_GOLDEN":
+                rejected.append({**order, "compliance_reason": f"BLOCKED: {status or 'NO_GOLDEN_COPY'}"})
                 continue
 
             ref_price = float(order.get("ref_price") or 0.0)
             shares = float(order.get("shares") or 0.0)
-            notional = float(
-                order.get("est_notional")
-                or order.get("order_value")
-                or ref_price * shares
-            )
-            adv_value = float(adv_20d_map.get(ticker, float("inf")))
+            notional_value = order.get("est_notional") or order.get("order_value")
+            notional = float(notional_value if notional_value is not None else ref_price * shares)
+            adv_value = float(adv_20d_map.get(ticker, float("nan")))
+            if (
+                not np.isfinite(ref_price)
+                or ref_price <= 0.0
+                or not np.isfinite(shares)
+                or shares <= 0.0
+                or not np.isfinite(notional)
+                or notional <= 0.0
+            ):
+                rejected.append({**order, "compliance_reason": "BLOCKED: invalid price, shares, or notional"})
+                continue
+            if not np.isfinite(adv_value) or adv_value <= 0.0:
+                rejected.append({**order, "compliance_reason": "BLOCKED: missing verified 20-day ADV"})
+                continue
+            if not np.isfinite(max_adv_participation) or max_adv_participation <= 0.0:
+                rejected.append({**order, "compliance_reason": "BLOCKED: invalid ADV participation limit"})
+                continue
             max_allowed = adv_value * float(max_adv_participation)
 
             if max_allowed > 0.0 and notional > max_allowed:
@@ -511,11 +528,18 @@ class AladdinRiskAndScenarioEngine:
                         "shares": scaled_shares,
                         "order_value": scaled_notional,
                         "est_notional": scaled_notional,
+                        "compliance_max_notional": round(max_allowed, 2),
                         "compliance_note": "SCALED_TO_ADV_CAP",
                     }
                 )
                 continue
 
-            approved.append({**order, "est_notional": notional})
+            approved.append(
+                {
+                    **order,
+                    "est_notional": notional,
+                    "compliance_max_notional": round(max_allowed, 2),
+                }
+            )
 
         return approved, rejected

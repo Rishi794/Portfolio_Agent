@@ -159,3 +159,16 @@ def test_invariant_5_kalman_psd_and_pre_trade_adv_compliance() -> None:
     assert len(rejected) == 1 and rejected[0]["ticker"] == "BAD_TICK.NS"
     assert len(approved) == 1 and approved[0]["est_notional"] <= 25000.0
     assert approved[0]["compliance_note"] == "SCALED_TO_ADV_CAP"
+
+    fail_closed_orders = [
+        {"ticker": "NO_GOLDEN", "action": "BUY", "shares": 1, "ref_price": 10.0},
+        {"ticker": "NO_ADV", "action": "SELL", "shares": 1, "ref_price": 10.0},
+    ]
+    safe, blocked = AladdinRiskAndScenarioEngine.enforce_pre_trade_compliance_gate(
+        fail_closed_orders,
+        golden_status_map={"NO_ADV": "VERIFIED_GOLDEN"},
+        adv_20d_map={},
+        max_adv_participation=0.05,
+    )
+    assert safe == []
+    assert {item["ticker"] for item in blocked} == {"NO_GOLDEN", "NO_ADV"}

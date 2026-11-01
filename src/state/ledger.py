@@ -1,10 +1,9 @@
-"""Event-sourced portfolio ledger.
+"""Portfolio snapshots with an append-only audit journal.
 
-State lives in three files on the ``data-state`` branch so that every portfolio
-mutation is auditable and replayable:
+State lives in three files on the ``data-state`` branch:
 
-* ``portfolio_ledger_<market>.json``  — current snapshot (positions, cash, PnL)
-* ``ledger_events.jsonl``            — append-only event log (source of truth)
+* ``portfolio_ledger_<market>.json``  — operational snapshot (positions, cash, PnL)
+* ``ledger_events.jsonl``            — append-only audit journal (not currently replayed)
 * ``pending_orders_<market>.json``    — orders awaiting the ``/approve`` reconciler
 """
 

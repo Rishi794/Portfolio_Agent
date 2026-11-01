@@ -251,12 +251,15 @@ class FlexModelReplayRuntime:
         frame = prices.copy()
         frame["ticker"] = frame["ticker"].astype(str)
         frame["date"] = pd.to_datetime(frame.get("date"), errors="coerce")
+        cutoff_day = pd.Timestamp(as_of)
+        if cutoff_day.tzinfo is not None:
+            cutoff_day = cutoff_day.tz_localize(None)
+        cutoff_day = cutoff_day.normalize()
         frame = frame[frame["ticker"].isin(names) & frame["date"].notna()]
-        frame = frame[frame["date"] <= pd.Timestamp(as_of).normalize()]
+        frame = frame[frame["date"] <= cutoff_day]
         if "knowledge_timestamp" in frame.columns:
             known_at = pd.to_datetime(frame["knowledge_timestamp"], utc=True, errors="coerce")
-            cutoff = pd.Timestamp(as_of)
-            cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+            cutoff = cutoff_day.tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
             frame = frame[known_at.notna() & (known_at <= cutoff)]
         columns = [
             column
@@ -274,13 +277,16 @@ class FlexModelReplayRuntime:
         frame["ticker"] = frame["ticker"].astype(str)
         frame["ex_date"] = pd.to_datetime(frame["ex_date"], errors="coerce")
         frame["knowledge_timestamp"] = pd.to_datetime(frame["knowledge_timestamp"], utc=True, errors="coerce")
-        cutoff = pd.Timestamp(as_of)
-        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        cutoff_day = pd.Timestamp(as_of)
+        if cutoff_day.tzinfo is not None:
+            cutoff_day = cutoff_day.tz_localize(None)
+        cutoff_day = cutoff_day.normalize()
+        cutoff = cutoff_day.tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
         return frame[
             (frame["market"] == market)
             & frame["ticker"].notna()
             & frame["ex_date"].notna()
-            & (frame["ex_date"] <= pd.Timestamp(as_of).normalize())
+            & (frame["ex_date"] <= cutoff_day)
             & (frame["knowledge_timestamp"] <= cutoff)
         ].sort_values(["ex_date", "ticker", "action_type"])
 

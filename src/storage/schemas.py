@@ -137,6 +137,7 @@ TABLE_SPECS: dict[str, TableSpec] = {
         columns={
             "ticker": "VARCHAR",
             "market": "VARCHAR",
+            "price_source": "VARCHAR",
             "date": "DATE",
             "open": "DOUBLE",
             "high": "DOUBLE",

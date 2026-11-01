@@ -322,7 +322,10 @@ class SelfCalibratingQuantEngine:
             row = []
             for column in factors.columns:
                 factor_ranks = pd.to_numeric(factors.loc[common, column], errors="coerce").rank(pct=True)
-                corr = factor_ranks.corr(forward_ranks)
+                if factor_ranks.nunique(dropna=True) < 2 or forward_ranks.nunique(dropna=True) < 2:
+                    corr = 0.0
+                else:
+                    corr = factor_ranks.corr(forward_ranks)
                 row.append(0.0 if corr is None or not np.isfinite(corr) else float(corr))
             records.append(row)
 

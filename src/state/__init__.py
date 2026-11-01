@@ -1,4 +1,4 @@
-"""Event-sourced portfolio state (tracked on the ``data-state`` branch)."""
+"""Portfolio snapshots and their append-only audit journal."""
 
 from .ledger import Ledger, Position
 

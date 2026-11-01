@@ -1,4 +1,4 @@
-"""Reconcile an ``/approve`` comment into the event-sourced ledger.
+"""Reconcile an ``/approve`` comment into the portfolio snapshot and audit journal.
 
 Two execution modes:
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -41,14 +42,14 @@ def _pending_files(state_dir: Path) -> list[Path]:
     return sorted(state_dir.glob("pending_orders*.json"))
 
 
-def _load_orders(path: Path) -> tuple[str | None, list[dict[str, Any]]]:
+def _load_orders(path: Path) -> tuple[str | None, list[dict[str, Any]], str | None]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return None, []
+        return None, [], None
     if isinstance(payload, list):
-        return None, payload
-    return payload.get("market"), payload.get("orders", []) or []
+        return None, payload, None
+    return payload.get("market"), payload.get("orders", []) or [], payload.get("run_id")
 
 
 def apply_corporate_actions(
@@ -121,6 +122,7 @@ def apply_approved_orders(
     lake_dir: str | Path | None = None,
     starting_cash: dict[str, float] | None = None,
     run_id: str | None = None,
+    expected_run_id: str | None = None,
 ) -> dict[str, Any]:
     state = Path(state_dir)
     pending_files = _pending_files(state)
@@ -128,6 +130,22 @@ def apply_approved_orders(
     if not pending_files:
         receipt.write_text("⚠️ No `pending_orders*.json` found on the `data-state` branch.\n", encoding="utf-8")
         return {"status": "no_pending_files", "orders": 0}
+
+    queues = [(path, *_load_orders(path)) for path in pending_files]
+    if expected_run_id is not None:
+        mismatches = [
+            (path.name, queued_run_id)
+            for path, _market, orders, queued_run_id in queues
+            if orders and (not expected_run_id or queued_run_id != expected_run_id)
+        ]
+        if mismatches:
+            details = ", ".join(f"{name}={queued_run_id or 'missing run id'}" for name, queued_run_id in mismatches)
+            receipt.write_text(
+                "⚠️ Approval refused: this issue run does not match the current pending queue "
+                f"(`{expected_run_id or 'missing issue run id'}`). Mismatched queue(s): {details}.\n",
+                encoding="utf-8",
+            )
+            return {"status": "stale_run", "orders": 0}
 
     overrides = parse_custom_fills(comment_body)
     starting_cash = starting_cash or {"US": 100_000.0, "INDIA": 1_000_000.0}
@@ -144,12 +162,15 @@ def apply_approved_orders(
         "",
     ]
 
-    for path in pending_files:
-        market, orders = _load_orders(path)
+    for path, market, orders, queued_run_id in queues:
         if not orders:
-            path.write_text(json.dumps({"market": market, "orders": []}, indent=2) + "\n", encoding="utf-8")
+            path.write_text(
+                json.dumps({"market": market, "run_id": queued_run_id, "orders": []}, indent=2) + "\n",
+                encoding="utf-8",
+            )
             continue
         market = market or ("INDIA" if "india" in path.stem else "US")
+        queue_run_id = queued_run_id or run_id
         ledger = Ledger(state, market, starting_cash=starting_cash.get(market, 100_000.0))
         snapshot = ledger.load()
 
@@ -182,11 +203,25 @@ def apply_approved_orders(
                 continue
             if ticker in overrides:
                 shares, fill_price = overrides[ticker]
+                queued_shares = float(order.get("shares", 0.0) or 0.0)
+                if shares > queued_shares + 1e-9:
+                    lines.append(
+                        f"| SKIP | `{ticker}` | 0 | — | — | — | requested fill exceeds approved shares |"
+                    )
+                    continue
             else:
                 shares = float(order.get("shares", 0.0) or 0.0)
                 fill_price = float(order.get("ref_price", 0.0) or 0.0)
-            if shares <= 0 or fill_price <= 0:
+            if not math.isfinite(shares) or not math.isfinite(fill_price) or shares <= 0 or fill_price <= 0:
                 continue
+
+            if expected_run_id is not None:
+                cap = float(order.get("compliance_max_notional") or 0.0)
+                if not math.isfinite(cap) or cap <= 0.0 or shares * fill_price > cap + 0.01:
+                    lines.append(
+                        f"| SKIP | `{ticker}` | 0 | — | — | — | fill exceeds the approved ADV notional cap |"
+                    )
+                    continue
 
             cost_bps = float(order.get("est_cost_bps", 11.88 if market == "INDIA" else 3.0) or 0.0)
             position = positions.get(ticker, {"shares": 0.0, "avg_cost": 0.0, "sector": order.get("sector", "UNKNOWN")})
@@ -253,14 +288,14 @@ def apply_approved_orders(
                     "approved_by": actor,
                     "market": market,
                 },
-                run_id=run_id,
+                run_id=queue_run_id,
             )
 
         snapshot["cash"] = round(cash, 2)
         snapshot["fees_paid"] = round(float(snapshot.get("fees_paid", 0.0) or 0.0) + fee_total, 2)
         snapshot["realized_pnl"] = round(float(snapshot.get("realized_pnl", 0.0) or 0.0) + realized_total, 2)
         snapshot["as_of"] = dt.date.today().isoformat()
-        snapshot["last_run_id"] = run_id or snapshot.get("last_run_id")
+        snapshot["last_run_id"] = queue_run_id or snapshot.get("last_run_id")
         ledger.save(snapshot)
         lines.append("")
         lines.append(
@@ -269,7 +304,19 @@ def apply_approved_orders(
         )
 
         # idempotency: the queue is cleared so a duplicate '/approve' books nothing
-        path.write_text(json.dumps({"market": market, "orders": [], "booked_at": dt.datetime.now(dt.timezone.utc).isoformat()}, indent=2) + "\n", encoding="utf-8")
+        path.write_text(
+            json.dumps(
+                {
+                    "market": market,
+                    "run_id": queue_run_id,
+                    "orders": [],
+                    "booked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
         totals["orders"] += booked
         totals["fees"] += fee_total
@@ -300,7 +347,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--actor", required=True)
     parser.add_argument("--receipt-out", type=Path, required=True)
     parser.add_argument("--lake-dir", type=Path, default=None)
+    parser.add_argument("--event-path", type=Path, required=True)
     args = parser.parse_args(argv)
+
+    expected_run_id = ""
+    try:
+        event = json.loads(args.event_path.read_text(encoding="utf-8"))
+        issue_body = str((event.get("issue") or {}).get("body") or "")
+        match = re.search(r"\*\*Run\*\*\s+`([^`]+)`", issue_body)
+        if match:
+            expected_run_id = match.group(1)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
 
     result = apply_approved_orders(
         args.state_dir,
@@ -309,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         args.actor,
         args.receipt_out,
         lake_dir=args.lake_dir,
+        expected_run_id=expected_run_id,
     )
     print(json.dumps(result, indent=2))
     return 0

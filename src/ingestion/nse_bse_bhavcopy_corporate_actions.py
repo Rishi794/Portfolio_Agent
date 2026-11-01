@@ -69,6 +69,7 @@ class IndianBhavcopyAndCorporateActionIngestor:
             {
                 "ticker": frame[symbol_column].astype(str).str.strip() + suffix,
                 "market": market,
+                "price_source": "NSE_UDIFF",
                 "date": day,
                 "open": _numeric(frame, ["OPEN_PRICE", "Open"]),
                 "high": _numeric(frame, ["HIGH_PRICE", "High"]),
@@ -132,9 +133,10 @@ class IndianBhavcopyAndCorporateActionIngestor:
                     "cash_dividend": dividend,
                     "isin": str(row.get("isin") or ""),
                     "raw_narrative": purpose[:300],
-                    "knowledge_timestamp": dt.datetime.combine(
-                        ex_date - dt.timedelta(days=1), dt.time(14, 0), tzinfo=dt.timezone.utc
-                    ),
+                    # The NSE endpoint does not expose a reliable announcement
+                    # timestamp. Stamp first observation time rather than inventing
+                    # an ex-date-adjacent timestamp that can leak into historical PIT.
+                    "knowledge_timestamp": dt.datetime.now(dt.timezone.utc),
                 }
             )
         return pd.DataFrame(out_rows).drop_duplicates(subset=["ticker", "ex_date", "action_type"]) if out_rows else pd.DataFrame()
@@ -165,7 +167,9 @@ class IndianBhavcopyAndCorporateActionIngestor:
                     "cash_dividend": 0.0,
                     "isin": "",
                     "raw_narrative": str(split.get("splitRatio", "")),
-                    "knowledge_timestamp": knowledge_timestamp_for_close(date, market, self.config),
+                    # Yahoo's chart endpoint exposes the action only after it is
+                    # announced; the observation time is a conservative PIT bound.
+                    "knowledge_timestamp": dt.datetime.now(dt.timezone.utc),
                 }
             )
         for dividend in (events.get("dividends") or {}).values():
@@ -180,17 +184,23 @@ class IndianBhavcopyAndCorporateActionIngestor:
                     "cash_dividend": float(dividend.get("amount", 0.0) or 0.0),
                     "isin": "",
                     "raw_narrative": "",
-                    "knowledge_timestamp": knowledge_timestamp_for_close(date, market, self.config),
+                    "knowledge_timestamp": dt.datetime.now(dt.timezone.utc),
                 }
             )
         return pd.DataFrame(rows)
 
 
-def adjust_for_actions(prices: pd.DataFrame, actions: pd.DataFrame) -> pd.DataFrame:
-    """Back-adjust OHLC/volume for splits and cash dividends, PIT-safely.
+def adjust_for_actions(
+    prices: pd.DataFrame,
+    actions: pd.DataFrame,
+    *,
+    as_of: dt.date | dt.datetime | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Build a total-return price history from raw bars and known actions.
 
-    Split factors multiply the *entire* pre-ex-date history, so the artificial jump
-    disappears while post-ex prices remain exactly as traded.
+    ``close`` remains the actual reported close for ticket pricing. ``adj_close``
+    and OHLC are put on a comparable post-action basis for return and spread
+    calculations. Only actions effective and known by ``as_of`` are applied.
     """
     if prices.empty:
         return prices
@@ -205,12 +215,29 @@ def adjust_for_actions(prices: pd.DataFrame, actions: pd.DataFrame) -> pd.DataFr
     for column in ("open", "high", "low", "close", "adj_close", "volume"):
         if column in out.columns:
             out[column] = pd.to_numeric(out[column], errors="coerce").astype("float64")
-    if actions is None or actions.empty:
+    if "dollar_volume" not in out.columns:
         out["dollar_volume"] = out["close"] * pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
+    else:
+        out["dollar_volume"] = pd.to_numeric(out["dollar_volume"], errors="coerce")
+    if actions is None or actions.empty:
         return out
 
     actions = actions.copy()
     actions["ex_date"] = pd.to_datetime(actions["ex_date"])
+    if as_of is not None:
+        cutoff_date = pd.Timestamp(as_of)
+        if cutoff_date.tzinfo is not None:
+            cutoff_date = cutoff_date.tz_localize(None)
+        cutoff_date = cutoff_date.normalize()
+        actions = actions[pd.to_datetime(actions["ex_date"]).dt.normalize() <= cutoff_date]
+        if "knowledge_timestamp" in actions.columns:
+            cutoff = pd.Timestamp(as_of)
+            cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+            known_at = pd.to_datetime(actions["knowledge_timestamp"], utc=True, errors="coerce")
+            actions = actions[known_at.notna() & (known_at <= cutoff)]
+    if actions.empty:
+        return out
+
     for ticker, group in actions.groupby("ticker"):
         mask = out["ticker"] == ticker
         if not mask.any():
@@ -220,13 +247,19 @@ def adjust_for_actions(prices: pd.DataFrame, actions: pd.DataFrame) -> pd.DataFr
             dividend = float(row.cash_dividend or 0.0)
             before = mask & (out["date"] < row.ex_date)
             if split_ratio and split_ratio != 1.0 and split_ratio > 0:
-                for column in ("open", "high", "low", "close", "adj_close"):
+                for column in ("open", "high", "low", "adj_close"):
                     if column in out.columns:
                         out.loc[before, column] = out.loc[before, column] / split_ratio
                 out.loc[before, "volume"] = pd.to_numeric(out.loc[before, "volume"], errors="coerce") * split_ratio
             if dividend > 0:
-                out.loc[before, "adj_close"] = out.loc[before, "adj_close"] - dividend
-    out["dollar_volume"] = out["adj_close"] * pd.to_numeric(out["volume"], errors="coerce").fillna(0.0)
+                previous = out.loc[before].sort_values("date").tail(1)
+                if previous.empty:
+                    continue
+                reference = float(previous["adj_close"].iloc[0])
+                multiplier = (reference - dividend) / reference if reference > dividend > 0.0 else 1.0
+                for column in ("open", "high", "low", "adj_close"):
+                    if column in out.columns:
+                        out.loc[before, column] = out.loc[before, column] * multiplier
     return out
 
 

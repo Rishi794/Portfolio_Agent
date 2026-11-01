@@ -56,6 +56,7 @@ class MarketDataIngestor:
                 {
                     "ticker": symbol,
                     "market": market,
+                    "price_source": "YAHOO_FINANCE",
                     "date": day,
                     "open": _pick(quote.get("open"), idx),
                     "high": _pick(quote.get("high"), idx),
@@ -81,9 +82,10 @@ class MarketDataIngestor:
         frame["date"] = pd.to_datetime(frame["date"]).dt.date
         frame["ticker"] = symbol
         frame["market"] = market
+        frame["price_source"] = "STOOQ"
         frame["adj_close"] = frame["close"]
         frame["knowledge_timestamp"] = [knowledge_timestamp_for_close(d, market, self.config) for d in frame["date"]]
-        return frame[["ticker", "market", "date", "open", "high", "low", "close", "volume", "adj_close", "knowledge_timestamp"]]
+        return frame[["ticker", "market", "price_source", "date", "open", "high", "low", "close", "volume", "adj_close", "knowledge_timestamp"]]
 
     # ------------------------------------------------------------------ India ---
     def fetch_nse_bhavcopy(self, day: dt.date, market: str = "INDIA") -> pd.DataFrame:
@@ -104,6 +106,7 @@ class MarketDataIngestor:
             {
                 "ticker": frame[symbol_col].astype(str).str.strip() + suffix,
                 "market": market,
+                "price_source": "NSE_UDIFF",
                 "date": day,
                 "open": _num(frame, ["OPEN_PRICE", "Open"]),
                 "high": _num(frame, ["HIGH_PRICE", "High"]),
@@ -128,6 +131,20 @@ class MarketDataIngestor:
                     frame = self.fetch_stooq(symbol, "US")
                 except SourceUnavailable:
                     continue
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def ingest_yahoo_history(self, symbols: list[str], market: str, range_: str = "2y") -> pd.DataFrame:
+        """Fetch Yahoo history for a market without applying a second adjustment."""
+        frames: list[pd.DataFrame] = []
+        for symbol in symbols:
+            try:
+                frame = self.fetch_yahoo(symbol, market, range_=range_)
+            except SourceUnavailable:
+                continue
             if not frame.empty:
                 frames.append(frame)
         if not frames:

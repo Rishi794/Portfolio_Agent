@@ -9,8 +9,8 @@ verification layer from ``src/verification``:
    journaling a ``compliance_gate`` event when it intervenes.
 3. Exact Euler risk attribution (MCTR/CCTR/PCTR), fat-tailed Student-t CVaR_99
    and market-driven scenario stress tests run on the live target book.
-4. The ledger snapshot is reconciled against the fixed-point double-entry
-   identity; telemetry lands in ``state/risk_attribution.json`` for the
+4. The float ledger snapshot is reconciled with a Decimal accounting identity;
+   telemetry lands in ``state/risk_attribution.json`` for the
    Open-Aladdin dashboard and the daily Issue.
 
 CLI-compatible with ``src.main_v4`` — the workflow swaps ``-m src.main_v4`` for
@@ -75,7 +75,9 @@ class V5OpenAladdinPipeline:
         combined = combined.drop_duplicates(subset=["market", "ticker", "trade_date"], keep="last")
         return int(self.reducer.lake.write("golden_copy", combined))
 
-    def golden_maps(self, market: str) -> tuple[dict[str, str], dict[str, float], list[str]]:
+    def golden_maps(
+        self, market: str, *, as_of: str | dt.date | pd.Timestamp | None = None
+    ) -> tuple[dict[str, str], dict[str, float], list[str]]:
         """Latest quorum status per ticker, 20d ADV, and quarantined tickers."""
         if not self.reducer.lake.exists("golden_copy"):
             return {}, {}, []
@@ -86,15 +88,22 @@ class V5OpenAladdinPipeline:
         if frame.empty:
             return {}, {}, []
         frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+        if as_of is not None:
+            frame = frame[frame["trade_date"] <= pd.Timestamp(as_of).normalize()]
+        if frame.empty:
+            return {}, {}, []
         frame = frame.sort_values("trade_date")
         latest = frame.groupby("ticker", sort=False).tail(1)
         status_map = {
             str(ticker): str(status) for ticker, status in zip(latest["ticker"], latest["golden_status"])
         }
-        adv_map = {
-            str(ticker): float(np.nanmean(group["dollar_volume_raw"].astype(float).to_numpy()[-20:]))
-            for ticker, group in frame.groupby("ticker", sort=False)
-        }
+        verified = frame[frame["golden_status"].astype(str) == "VERIFIED_GOLDEN"]
+        adv_map: dict[str, float] = {}
+        for ticker, group in verified.groupby("ticker", sort=False):
+            values = pd.to_numeric(group["dollar_volume_raw"], errors="coerce")
+            values = values[np.isfinite(values) & (values > 0.0)].tail(20)
+            if not values.empty:
+                adv_map[str(ticker)] = float(values.mean())
         quarantined = sorted(
             ticker for ticker, status in status_map.items() if status != "VERIFIED_GOLDEN"
         )
@@ -108,7 +117,7 @@ class V5OpenAladdinPipeline:
         for run in summary.get("runs", []):
             market = str(run["market"])
             tickets = list(run.get("tickets") or [])
-            status_map, adv_map, quarantined = self.golden_maps(market)
+            status_map, adv_map, quarantined = self.golden_maps(market, as_of=summary.get("as_of"))
             approved, blocked = self.engine.enforce_pre_trade_compliance_gate(
                 tickets, status_map, adv_map, self.max_adv_participation
             )
@@ -119,19 +128,84 @@ class V5OpenAladdinPipeline:
                 if proposed_shares.get(str(order["ticker"])) != float(order.get("shares") or 0.0)
             ]
             changed = bool(blocked) or bool(scaled) or len(approved) != len(tickets)
-
             run["tickets"] = approved
             run["compliance_blocked_orders"] = _jsonable(blocked)
             run["compliance_scaled_orders"] = scaled
             run["quarantined_tickers"] = quarantined
 
-            if changed:
-                ledger = Ledger(
-                    self.state_dir,
-                    market,
-                    starting_cash=float(self.reducer.starting_cash.get(market, 100_000.0)),
+            # Reconcile the optimizer target with the orders that actually survived
+            # verification/liquidity controls. This is the recommendation shown in
+            # the Issue and the book used by V5 risk attribution.
+            ledger = Ledger(
+                self.state_dir,
+                market,
+                starting_cash=float(self.reducer.starting_cash.get(market, 100_000.0)),
+            )
+            snapshot = ledger.load()
+            equity = ledger.equity(snapshot)
+            targets = {str(key): float(value) for key, value in (run.get("targets") or {}).items()}
+            if not targets and not tickets:
+                # No usable signal means hold the persisted book. Reporting an
+                # empty target here would falsely show zero market risk.
+                targets = ledger.current_weights(snapshot)
+            approved_by_ticker = {str(order["ticker"]): order for order in approved}
+            blocked_tickers = {str(order.get("ticker", "")) for order in blocked}
+            for proposed_order in tickets:
+                ticker = str(proposed_order["ticker"])
+                current_weight = float(proposed_order.get("current_weight_pct") or 0.0) / 100.0
+                order = approved_by_ticker.get(ticker)
+                if order is None:
+                    targets[ticker] = current_weight
+                    continue
+                side = 1.0 if str(order.get("action", "")).upper() == "BUY" else -1.0
+                executed_notional = float(order.get("shares") or 0.0) * float(order.get("ref_price") or 0.0)
+                if equity > 0.0:
+                    targets[ticker] = max(current_weight + side * executed_notional / equity, 0.0)
+            run["targets"] = _jsonable(pd.Series(targets, dtype=float).round(6).to_dict())
+
+            # Update same-run target rows so the lakehouse, Issue, pending queue and
+            # risk telemetry agree about the compliance-adjusted allocation.
+            target_rows = self.reducer.lake.read("portfolio_targets")
+            if not target_rows.empty and summary.get("as_of"):
+                as_of = pd.Timestamp(summary["as_of"]).normalize()
+                row_mask = (
+                    (target_rows["market"].astype(str) == market)
+                    & (pd.to_datetime(target_rows["date"]).dt.normalize() == as_of)
                 )
-                ledger.write_pending_orders(approved, run_id=run_id)
+                if row_mask.any():
+                    target_rows.loc[row_mask, "target_weight"] = target_rows.loc[row_mask, "ticker"].astype(str).map(targets).fillna(
+                        target_rows.loc[row_mask, "target_weight"]
+                    )
+                    approved_rows = {str(order["ticker"]): order for order in approved}
+                    for row_index in target_rows.index[row_mask]:
+                        ticker = str(target_rows.at[row_index, "ticker"])
+                        order = approved_rows.get(ticker)
+                        target_rows.at[row_index, "order_shares"] = float(order.get("shares", 0.0)) if order else 0.0
+                        target_rows.at[row_index, "order_value"] = float(order.get("order_value", 0.0)) if order else 0.0
+                        if ticker in blocked_tickers:
+                            target_rows.at[row_index, "binding_constraint"] = "compliance_block"
+                        elif ticker in set(scaled):
+                            target_rows.at[row_index, "binding_constraint"] = "adv_cap"
+                    self.reducer.lake.write("portfolio_targets", target_rows.loc[row_mask])
+
+            if isinstance(run.get("diagnostics"), dict):
+                run["diagnostics"]["orders"] = len(approved)
+                run["diagnostics"]["invested_weight"] = float(sum(targets.values()))
+                run["diagnostics"]["cash_buffer"] = max(1.0 - float(sum(targets.values())), 0.0)
+                run["diagnostics"]["target_names"] = sum(weight > 0.0 for weight in targets.values())
+                run["diagnostics"].update(
+                    self.reducer._timestral_risk_inputs(
+                        market, pd.Series(targets, dtype=float), ledger.current_weights(snapshot)
+                    )
+                )
+
+            for order in approved:
+                if str(order.get("ticker")) in targets:
+                    order["target_weight_pct"] = round(targets[str(order["ticker"])] * 100.0, 4)
+
+            # Always replace the queue, including a valid empty recommendation.
+            ledger.write_pending_orders(approved, run_id=run_id)
+            if changed:
                 ledger.record_event(
                     "compliance_gate",
                     {
@@ -142,9 +216,6 @@ class V5OpenAladdinPipeline:
                     },
                     run_id=run_id,
                 )
-                if isinstance(run.get("diagnostics"), dict):
-                    run["diagnostics"]["orders"] = len(approved)
-
             per_market[market] = {
                 "proposed": len(tickets),
                 "approved": len(approved),
@@ -181,7 +252,7 @@ class V5OpenAladdinPipeline:
         cvar_pct = 0.0
         euler_rows: list[dict[str, Any]] = []
         stress: dict[str, float] = {}
-        if not returns.empty and len(weights) >= 2:
+        if not returns.empty and len(weights) >= 1:
             volatility_pct, cvar_pct, table = self.engine.compute_euler_risk_decomposition(weights, returns)
             euler_rows = _jsonable(table.head(20).to_dict(orient="records"))
             proxies = self.engine.build_proxy_factors(returns)
@@ -260,9 +331,9 @@ class V5OpenAladdinPipeline:
                     "ibor_identity_ok",
                 )
             }
-        payload = json.dumps(_jsonable(telemetry), sort_keys=True, default=str).encode("utf-8")
-        telemetry["merkle_state_hash"] = hashlib.sha256(payload).hexdigest()
         telemetry["compliance_gate"] = summary.get("compliance_gate", {})
+        payload = json.dumps(_jsonable(telemetry), sort_keys=True, default=str).encode("utf-8")
+        telemetry["telemetry_sha256"] = hashlib.sha256(payload).hexdigest()
         return telemetry
 
     def write_telemetry(self, telemetry: dict[str, Any]) -> Path:
@@ -298,8 +369,8 @@ def format_aladdin_markdown(summary: dict[str, Any], telemetry: dict[str, Any]) 
         "",
         "## 🛡️ V5 Open-Aladdin — Risk Attribution, Compliance & Stress Telemetry",
         "",
-        f"- **Merkle state hash:** `{str(telemetry.get('merkle_state_hash', ''))[:16]}...` "
-        "(SHA-256 over the full telemetry payload)",
+        f"- **Telemetry SHA-256:** `{str(telemetry.get('telemetry_sha256', ''))[:16]}...` "
+        "(SHA-256 of the telemetry payload, excluding this hash field)",
         "",
     ]
     for market, info in (telemetry.get("markets") or {}).items():

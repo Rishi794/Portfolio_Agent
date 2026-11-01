@@ -44,6 +44,7 @@ from .filtering.self_calibrating_engine import SelfCalibratingQuantEngine
 from .filtering.statistics import sector_zscore, winsorize, zscore
 from .filtering.timestral_forecaster import TIMESTRAL_PILLAR, TimestralForecastEngine
 from .portfolio.hrp_optimizer import HRPOptimizer
+from .ingestion.nse_bse_bhavcopy_corporate_actions import adjust_for_actions
 from .state.ledger import Ledger
 from .storage.lakehouse import Lakehouse, manifest_row
 
@@ -114,6 +115,11 @@ class V4AutonomousPortfolioReducer:
         self.run_id = f"{uuid.uuid4().hex[:8]}-{self.as_of:%Y%m%d}"
         self.calibration_rows: list[dict[str, Any]] = []
 
+    @property
+    def as_of_utc_cutoff(self) -> pd.Timestamp:
+        """Inclusive end-of-day cutoff for facts known during the as-of date."""
+        return self.as_of.tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
     # ===================================================================== ingest
     def ingest_shards(self) -> dict[str, int]:
         written: dict[str, int] = {}
@@ -143,12 +149,24 @@ class V4AutonomousPortfolioReducer:
         if frame.empty:
             return frame
         frame["date"] = pd.to_datetime(frame["date"])
-        frame = frame[pd.to_datetime(frame["knowledge_timestamp"], utc=True) <= pd.Timestamp(self.as_of, tz="UTC")]
+        frame = frame[pd.to_datetime(frame["knowledge_timestamp"], utc=True) <= self.as_of_utc_cutoff]
         frame = frame[frame["date"] <= self.as_of]
         frame["adj_close"] = pd.to_numeric(frame.get("adj_close"), errors="coerce").fillna(
             pd.to_numeric(frame["close"], errors="coerce")
         )
         frame = frame.sort_values(["ticker", "date"]).drop_duplicates(subset=["ticker", "date"], keep="last")
+        # NSE UDiFF rows are raw. Rebuild adjusted history at the requested as-of
+        # date using only actions whose ex-date and observation time are known then.
+        # Yahoo's adj_close already includes its corporate-action adjustment and
+        # must never be passed through this transformation again.
+        raw_nse = frame.get("price_source", pd.Series(index=frame.index, dtype="object")).eq("NSE_UDIFF")
+        if raw_nse.any():
+            actions = self.lake.read("corporate_actions")
+            if not actions.empty:
+                actions = actions[actions["market"].astype(str) == market]
+            adjusted = adjust_for_actions(frame.loc[raw_nse], actions, as_of=self.as_of_utc_cutoff)
+            columns = [column for column in ("open", "high", "low", "adj_close", "volume", "dollar_volume") if column in adjusted]
+            frame.loc[adjusted.index, columns] = adjusted[columns]
         return frame
 
     def close_wide(self, market: str) -> pd.DataFrame:
@@ -175,18 +193,18 @@ class V4AutonomousPortfolioReducer:
         macro = self.lake.read("macro_external_pit")
         if macro.empty:
             return macro
-        macro = macro[pd.to_datetime(macro["vintage_timestamp"], utc=True) <= pd.Timestamp(self.as_of, tz="UTC")]
+        macro = macro[pd.to_datetime(macro["vintage_timestamp"], utc=True) <= self.as_of_utc_cutoff]
         return macro.sort_values("observation_date")
 
     def events_snapshot(self) -> pd.DataFrame:
         events = self.lake.read("policy_geopol_events")
         if events.empty:
             return events
-        events = events[pd.to_datetime(events["published_timestamp"], utc=True) <= pd.Timestamp(self.as_of, tz="UTC")]
+        events = events[pd.to_datetime(events["published_timestamp"], utc=True) <= self.as_of_utc_cutoff]
         return events.reset_index(drop=True)
 
     def fundamentals_snapshot(self, market: str) -> pd.DataFrame:
-        frame = self.lake.snapshot_at("fundamentals_pit", self.as_of, entity=["ticker"])
+        frame = self.lake.snapshot_at("fundamentals_pit", self.as_of_utc_cutoff, entity=["ticker"])
         if frame.empty:
             return frame
         frame = frame[frame["market"].astype(str) == market].copy()
@@ -198,7 +216,7 @@ class V4AutonomousPortfolioReducer:
         return frame
 
     def tech_snapshot(self, market: str) -> pd.DataFrame:
-        frame = self.lake.snapshot_at("tech_evolution_pit", self.as_of, entity=["ticker"])
+        frame = self.lake.snapshot_at("tech_evolution_pit", self.as_of_utc_cutoff, entity=["ticker"])
         if frame.empty:
             return frame
         frame = frame[frame["market"].astype(str) == market]
@@ -344,7 +362,9 @@ class V4AutonomousPortfolioReducer:
         if subset.empty:
             return pd.Series(0.0, index=company_vectors.index, dtype=float), {"events": 0.0}
         projector = EventProjector(self.config, backend=get_backend(self.embed_backend))
-        result = projector.project_to_tickers(company_vectors, subset, as_of=pd.Timestamp(self.as_of, tz="UTC").to_pydatetime())
+        result = projector.project_to_tickers(
+            company_vectors, subset, as_of=self.as_of_utc_cutoff.to_pydatetime()
+        )
         diagnostics = dict(result.diagnostics)
         diagnostics["domain_key"] = domain_key
         diagnostics["domains"] = ",".join(map(str, domains))
@@ -457,11 +477,11 @@ class V4AutonomousPortfolioReducer:
             return {}
         frame["ex_date"] = pd.to_datetime(frame["ex_date"])
         frame = frame[
-            pd.to_datetime(frame["knowledge_timestamp"], utc=True) <= pd.Timestamp(self.as_of, tz="UTC")
+            pd.to_datetime(frame["knowledge_timestamp"], utc=True) <= self.as_of_utc_cutoff
         ]
         horizon = int(self.config.get("aladdin.timestral.ex_date_horizon_days", 30))
         window = frame[
-            (frame["ex_date"] >= self.as_of) & (frame["ex_date"] <= self.as_of + pd.Timedelta(days=horizon))
+            (frame["ex_date"] > self.as_of) & (frame["ex_date"] <= self.as_of + pd.Timedelta(days=horizon))
         ]
         out: dict[str, set[dt.date]] = {}
         for ticker, group in window.groupby("ticker", sort=False):
@@ -643,7 +663,7 @@ class V4AutonomousPortfolioReducer:
         metadata = pd.DataFrame(
             {
                 "eligible": gate.reindex(universe_index).fillna(False),
-                "price": close_wide.iloc[-1].reindex(universe_index) if not close_wide.empty else np.nan,
+                "price": self._latest_trade_prices(market).reindex(universe_index) if not close_wide.empty else np.nan,
                 "gics_sector": pd.Series("UNKNOWN", index=universe_index, dtype="object"),
             },
             index=universe_index,
@@ -663,6 +683,14 @@ class V4AutonomousPortfolioReducer:
             }
         )
         return factors, diagnostics
+
+    def _latest_trade_prices(self, market: str) -> pd.Series:
+        """Latest observed close for order sizing; adjusted closes are return inputs only."""
+        frame = self.price_snapshot(market)
+        if frame.empty:
+            return pd.Series(dtype=float)
+        latest = frame.sort_values("date").drop_duplicates("ticker", keep="last")
+        return pd.to_numeric(latest.set_index("ticker")["close"], errors="coerce")
 
     # ======================================================================= fuse
     def pillar_weights(self, market: str, regime: RegimeAllocation, factors: pd.DataFrame) -> tuple[np.ndarray, dict[str, Any]]:
@@ -844,6 +872,11 @@ class V4AutonomousPortfolioReducer:
         regime = self.regime_detector.detect(macro_matrix)
         factors, diagnostics = self.build_factor_matrix(market, regime, macro_matrix)
         if factors.empty:
+            Ledger(
+                self.state_dir,
+                market,
+                starting_cash=self.starting_cash.get(market, 100_000.0),
+            ).write_pending_orders([], run_id=self.run_id)
             return MarketRun(market, regime, 0, 0, pd.Series(dtype=float), pd.Series(dtype=float), [], diagnostics)
 
         alpha, ortho, fusion_diagnostics = self.fuse(market, factors, regime)
@@ -910,8 +943,10 @@ class V4AutonomousPortfolioReducer:
             )
             self.lake.write("portfolio_targets", targets_table)
 
+        # A zero-order run must replace the old queue, otherwise a fresh issue can
+        # accidentally approve yesterday's tickets.
+        ledger.write_pending_orders(tickets, run_id=self.run_id)
         if tickets:
-            ledger.write_pending_orders(tickets, run_id=self.run_id)
             ledger.record_event("recommendation", {"orders": len(tickets), "regime": regime.regime_name}, run_id=self.run_id)
         self._append_nav(market, ledger, equity)
 
@@ -985,6 +1020,15 @@ class V4AutonomousPortfolioReducer:
                     "diagnostics": _jsonable(run.diagnostics),
                 }
             )
+
+        # A market-scoped dispatch must not leave the other market's previous
+        # recommendation executable from this run's approval issue.
+        for inactive_market in {"US", "INDIA"}.difference(markets):
+            Ledger(
+                self.state_dir,
+                inactive_market,
+                starting_cash=self.starting_cash.get(inactive_market, 100_000.0),
+            ).write_pending_orders([], run_id=self.run_id)
 
         if self.calibration_rows:
             self.lake.write("calibration_state", pd.DataFrame(self.calibration_rows))

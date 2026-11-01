@@ -6,9 +6,9 @@ Each of the 10 matrix jobs ([US-0..4, INDIA-0..4]) writes three Zstd Parquet sha
     corporate_actions_<market>_<shard>.parquet -> corporate_actions
     fundamentals_<market>_<shard>.parquet      -> fundamentals_pit (+ business_embedding)
 
-Splits/bonuses/dividends are back-adjusted *from the corporate-action table* before
-the shard is written, so no artificial price jump ever reaches the Kalman filter, the
-HRP covariance or the Corwin-Schultz spread estimator.
+Raw exchange OHLCV and vendor-adjusted Yahoo series are kept distinct. Corporate
+actions are applied later by the reducer using only actions known by its as-of time,
+so retrospective corrections do not contaminate point-in-time backtests.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from .fundamentals_edgar_indian_xbrl import (
     load_price_panel,
 )
 from .market_data import MarketDataIngestor, trailing_trading_days
-from .nse_bse_bhavcopy_corporate_actions import IndianBhavcopyAndCorporateActionIngestor, adjust_for_actions
+from .nse_bse_bhavcopy_corporate_actions import IndianBhavcopyAndCorporateActionIngestor
 from .universe import UniverseLoader, shard_of
 
 
@@ -104,10 +104,26 @@ class UnifiedCompanyShardWorker:
             frame = self.india_actions.fetch_unified_india_bhavcopy(day)
             if not frame.empty:
                 bhavcopy_frames.append(frame[frame["ticker"].isin(symbols)])
-        prices = pd.concat(bhavcopy_frames, ignore_index=True) if bhavcopy_frames else pd.DataFrame()
-
-        if prices.empty:  # Yahoo fallback for India
-            prices = self.market_data.ingest_india(symbols, days)
+        official_prices = pd.concat(bhavcopy_frames, ignore_index=True) if bhavcopy_frames else pd.DataFrame()
+        # NSE UDiFF bhavcopies are the authoritative recent bars, but pulling a
+        # year's worth of full-market CSVs per shard is wasteful. Yahoo provides
+        # the longer history used by rolling covariance/forecast windows; official
+        # NSE rows replace it over the latest 30 sessions where available.
+        history = self.market_data.ingest_yahoo_history(
+            symbols, "INDIA", range_=_range_from_days(self.lookback_days)
+        )
+        if history.empty:
+            prices = official_prices
+        elif official_prices.empty:
+            prices = history
+        else:
+            prices = pd.concat([history, official_prices], ignore_index=True)
+            prices["date"] = pd.to_datetime(prices["date"]).dt.normalize()
+            prices = (
+                prices.sort_values(["ticker", "date"])
+                .drop_duplicates(["ticker", "date"], keep="last")
+                .reset_index(drop=True)
+            )
 
         nse_actions = self.india_actions.fetch_nse_corporate_actions(
             dt.date.today() - dt.timedelta(days=self.lookback_days), dt.date.today() + dt.timedelta(days=5)
@@ -121,6 +137,12 @@ class UnifiedCompanyShardWorker:
         if not nse_actions.empty and not prices.empty:
             nse_actions = nse_actions[nse_actions["ticker"].isin(prices["ticker"].unique())]
         actions = pd.concat([nse_actions, yahoo_actions], ignore_index=True) if not nse_actions.empty else yahoo_actions
+        if not actions.empty:
+            # Prefer the official NSE record when Yahoo reports the same event.
+            actions["ex_date"] = pd.to_datetime(actions["ex_date"]).dt.normalize()
+            actions = actions.drop_duplicates(
+                subset=["ticker", "ex_date", "action_type"], keep="first"
+            ).reset_index(drop=True)
         return prices, actions
 
     def ingest_fundamentals(self, universe: pd.DataFrame) -> pd.DataFrame:
@@ -180,7 +202,6 @@ class UnifiedCompanyShardWorker:
 
         prices, actions = self.ingest_prices(symbols)
         if not prices.empty:
-            prices = adjust_for_actions(prices, actions)
             if "dollar_volume" not in prices.columns:
                 prices["dollar_volume"] = pd.to_numeric(prices["close"], errors="coerce") * pd.to_numeric(
                     prices["volume"], errors="coerce"

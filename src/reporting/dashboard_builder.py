@@ -1,11 +1,11 @@
 """V5 Open-Aladdin dashboard: static GitHub Pages analytics portal (Plotly CDN).
 
-Reads the event-sourced state directory written by the reducer and the approval
+Reads the portfolio state directory written by the reducer and the approval
 reconciler — ``portfolio_ledger_<market>.json``, ``pending_orders_*.json``,
 ``ledger_events.jsonl``, ``nav_history.jsonl`` and ``risk_attribution.json`` —
 and emits one self-contained HTML file. No build step, no server, no cost.
 
-Panels: dual-market books (equity / cash / σp / CVaR99 / Merkle badge),
+Panels: dual-market books (equity / cash / σp / CVaR99 / state hash badge),
 walk-forward NAV, Euler risk decomposition (capital weight vs % of total risk),
 market-driven scenario stress tests, pre-trade-approved pending orders and the
 cryptographic ledger audit trail.
@@ -124,7 +124,7 @@ def build_payload(state_dir: Path) -> dict[str, Any]:
     return {
         "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "run_mode": "live" if has_state else "synthetic_demo",
-        "merkle_state_hash": risk_doc.get("merkle_state_hash") if isinstance(risk_doc, dict) else None,
+        "telemetry_sha256": risk_doc.get("telemetry_sha256") if isinstance(risk_doc, dict) else None,
         "books": books,
         "pending": pending,
         "events": events,
@@ -175,13 +175,13 @@ TEMPLATE = """<!DOCTYPE html>
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;">
     <span class="badge" id="ts-badge">loading…</span>
-    <span class="badge" id="merkle-badge"></span>
+    <span class="badge" id="telemetry-hash-badge"></span>
   </div>
 </header>
 
 <div class="grid-2">
   <div class="card" id="card-us">
-    <h2><span>🇺🇸 US Book (NYSE / NASDAQ — USD)</span><span class="badge" id="us-merkle"></span></h2>
+    <h2><span>🇺🇸 US Book (NYSE / NASDAQ — USD)</span><span class="badge" id="us-ledger-hash"></span></h2>
     <div class="kpi-row">
       <div class="kpi"><span>Total Equity</span><strong id="us-eq">—</strong></div>
       <div class="kpi"><span>Cash</span><strong id="us-cash">—</strong></div>
@@ -196,7 +196,7 @@ TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="card" id="card-india">
-    <h2><span>🇮🇳 India Book (NSE / BSE — INR)</span><span class="badge" id="india-merkle"></span></h2>
+    <h2><span>🇮🇳 India Book (NSE / BSE — INR)</span><span class="badge" id="india-ledger-hash"></span></h2>
     <div class="kpi-row">
       <div class="kpi"><span>Total Equity</span><strong id="india-eq">—</strong></div>
       <div class="kpi"><span>Cash</span><strong id="india-cash">—</strong></div>
@@ -247,8 +247,8 @@ const layout = (title) => ({
 });
 
 document.getElementById('ts-badge').textContent = 'Golden Copy Sync: ' + DATA.generated_at;
-if (DATA.merkle_state_hash) {
-  document.getElementById('merkle-badge').textContent = 'MERKLE: ' + DATA.merkle_state_hash.slice(0, 16);
+if (DATA.telemetry_sha256) {
+  document.getElementById('telemetry-hash-badge').textContent = 'TELEMETRY SHA-256: ' + DATA.telemetry_sha256.slice(0, 16);
 }
 document.getElementById('footer').textContent = DATA.run_mode === 'live'
   ? 'Live dual-market state from the data-state branch · rebuilt on every pipeline and /approve run.'
@@ -266,7 +266,7 @@ function renderBook(prefix, book) {
     ? risk.daily_fused_cvar99_pct : risk.daily_student_t_cvar99_pct;
   document.getElementById(prefix + '-cvar').textContent =
     cvar !== undefined ? '-' + Number(cvar).toFixed(2) + '%' : '—';
-  document.getElementById(prefix + '-merkle').textContent =
+  document.getElementById(prefix + '-ledger-hash').textContent =
     risk.ledger_state_sha256 ? 'LEDGER: ' + risk.ledger_state_sha256.slice(0, 12) : 'LEDGER: genesis';
 
   const nav = book.nav || [];

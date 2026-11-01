@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -63,14 +64,21 @@ def build_issue_body(
 
 def _run_for(summary: dict[str, Any], market: str):
     for run in summary.get("runs", []):
-        if getattr(run, "market", None) == market:
+        if _field(run, "market") == market:
             return run
     return None
 
 
+def _field(value: Any, key: str, default: Any = None) -> Any:
+    """Read run records from either the reducer dataclass or its JSON summary."""
+    if isinstance(value, Mapping):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
 def _market_block(market: str, run, diagnostics: dict[str, Any], top_n: int) -> list[str]:
     currency = "₹" if market == "INDIA" else "$"
-    regime = diagnostics.get("regime", "UNKNOWN")
+    regime = diagnostics.get("regime", _field(run, "regime", "UNKNOWN"))
     lines = [
         f"## {'🇮🇳' if market == 'INDIA' else '🇺🇸'} {market} (`{currency}`)",
         "",
@@ -107,12 +115,15 @@ def _market_block(market: str, run, diagnostics: dict[str, Any], top_n: int) -> 
     )
     lines.append("")
 
-    target = getattr(run, "target_weights", None)
-    alpha = getattr(run, "alpha", None)
-    if target is not None and not target.empty:
+    target = _field(run, "target_weights", None)
+    if target is None:
+        target = _field(run, "targets", {})
+    target = target if isinstance(target, pd.Series) else pd.Series(target or {}, dtype=float)
+    alpha = _field(run, "alpha", {})
+    alpha = alpha if isinstance(alpha, pd.Series) else pd.Series(alpha or {}, dtype=float)
+    if not target.empty:
         lines.append(f"| # | Ticker | Target wt | α (ortho) | {currency} level |")
         lines.append("| ---: | :--- | ---: | ---: | ---: |")
-        price_series = pd.Series(dtype=float)
         for idx, (ticker, weight) in enumerate(target.head(top_n).items(), start=1):
             score = float(alpha.get(ticker, 0.0)) if alpha is not None else 0.0
             lines.append(f"| {idx} | `{ticker}` | {weight * 100:.2f}% | {score:+.3f} | — |")
@@ -135,7 +146,7 @@ def _order_block(summary: dict[str, Any], top_n: int) -> list[str]:
     runs = summary.get("runs", [])
     tickets: list[dict[str, Any]] = []
     for run in runs:
-        for ticket in getattr(run, "tickets", []) or []:
+        for ticket in _field(run, "tickets", []) or []:
             tickets.append(ticket)
     lines = ["## Pending orders (await approval)", ""]
     if not tickets:
@@ -200,7 +211,7 @@ def _approval_block() -> list[str]:
         "- `/approve TICKER=shares@price ...` — book real broker fills, e.g. "
         "`/approve NVDA=25@128.40 RELIANCE.NS=40@2945.50`.",
         "",
-        "The approval workflow reconciles splits/dividends, updates the event-sourced ledger, rebuilds the "
+        "The approval workflow reconciles splits/dividends, updates the portfolio ledger and audit journal, rebuilds the "
         "dashboard and closes this issue. Duplicate `/approve` comments are idempotent (the queue is cleared).",
         "",
     ]

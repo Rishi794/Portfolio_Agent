@@ -76,7 +76,10 @@ class HRPOptimizer:
         if len(columns) < 3:
             return columns
         data = returns.to_numpy(dtype=float)
-        correlation = np.corrcoef(data, rowvar=False)
+        # Constant-return names have undefined pairwise correlations; the result is
+        # sanitized below, so suppress NumPy's expected divide-by-zero warning.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            correlation = np.corrcoef(data, rowvar=False)
         correlation = np.nan_to_num(correlation, nan=0.0)
         np.fill_diagonal(correlation, 1.0)
         distance = np.sqrt(np.maximum(0.5 * (1.0 - correlation), 0.0))

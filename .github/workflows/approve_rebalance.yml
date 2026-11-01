@@ -58,7 +58,8 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra onnx
 
-      - name: Reconcile fills into the event-sourced ledger
+      - id: reconcile
+        name: Reconcile fills into the portfolio ledger
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
@@ -67,8 +68,12 @@ jobs:
             --comment-body "$COMMENT_BODY" \
             --issue-number "${{ github.event.issue.number }}" \
             --actor "${{ github.event.comment.user.login }}" \
+            --event-path "$GITHUB_EVENT_PATH" \
             --receipt-out fill_receipt.md \
-            --lake-dir data_lake
+            --lake-dir data_lake > approval_result.json
+          cat approval_result.json
+          STATUS=$(python3 -c "import json; print(json.load(open('approval_result.json'))['status'])")
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Rebuild the static dashboard
         run: |
@@ -91,11 +96,17 @@ jobs:
             git push origin HEAD:data-state
           fi
 
-      - name: Post the receipt and close the recommendation
+      - name: Post the approval receipt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --body-file fill_receipt.md
+
+      - name: Close the recommendation after a current-run approval
+        if: steps.reconcile.outputs.status != 'stale_run'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           gh issue close "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --reason completed
 
       - uses: actions/upload-pages-artifact@v5

@@ -61,7 +61,8 @@ def correlation_matrix(factors: pd.DataFrame) -> pd.DataFrame:
     frame = factors.apply(pd.to_numeric, errors="coerce").fillna(0.0)
     if len(frame) < 2:
         return pd.DataFrame(np.eye(frame.shape[1]), index=frame.columns, columns=frame.columns)
-    corr = np.corrcoef(frame.to_numpy(dtype=float), rowvar=False)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = np.corrcoef(frame.to_numpy(dtype=float), rowvar=False)
     corr = np.nan_to_num(corr, nan=0.0)
     np.fill_diagonal(corr, 1.0)
     return pd.DataFrame(corr, index=frame.columns, columns=frame.columns)

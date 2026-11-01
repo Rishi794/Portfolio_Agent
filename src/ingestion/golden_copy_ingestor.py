@@ -3,10 +3,10 @@
 Feeds (all free; keys optional):
 
 * INDIA — S1: official NSE UDiFF bhavcopy (``sec_bhavdata_full``, carries the
-  ISIN); S2: official BSE UDiFF bhavcopy cross-matched by ISIN (falls back to the
-  Yahoo ``.BO`` listing print when the BSE file is unreachable); S3: Yahoo
-  Finance ``.NS``. A bar needs the NSE official row plus at least one independent
-  second print; a stale Yahoo leg (no bar for the trade date) never fabricates one.
+  ISIN); S2: official BSE UDiFF bhavcopy cross-matched by ISIN; S3: Yahoo
+  Finance ``.NS``. Yahoo's ``.BO`` and ``.NS`` listings are the same vendor and
+  therefore never count as two independent sources. A stale Yahoo leg (no bar for
+  the trade date) never fabricates one.
 * US — S1: Tiingo IEX official EOD (free key; skipped when absent); S2: Stooq
   EOD; S3: Yahoo Finance chart.
 
@@ -264,12 +264,6 @@ class MultiSourceGoldenCopyIngestor:
                 bse_turnover = bse_row.get("bse_turnover")
                 if bse_turnover is not None and np.isfinite(float(bse_turnover)):
                     turnover += float(bse_turnover)
-            elif yahoo_close is not None:
-                bse_symbol = ticker[:-3] + ".BO" if ticker.endswith(".NS") else f"{ticker}.BO"
-                bo_close, _ = self._current_and_trailing(self._yahoo_frame(bse_symbol), day)
-                if bo_close is not None:
-                    sources["BSE_YAHOO"] = bo_close
-
             if len(sources) < self.min_sources:
                 dropped += 1
                 continue
@@ -330,13 +324,6 @@ class MultiSourceGoldenCopyIngestor:
             stooq_close = self._stooq_close(ticker, day)
             if stooq_close is not None:
                 sources["STOOQ_EOD"] = stooq_close
-            if len(sources) == 1 and open_p > 0.0:
-                # Degraded mode: neither Tiingo nor Stooq answered, so mirror the
-                # single vendor print under the primary-exchange name to satisfy
-                # the 2-of-3 floor (same value, tracked via ``sources_agreed``).
-                # The Hampel MAD gate still quarantines unexplained spikes.
-                sources["PRIMARY_EXCHANGE_CLOSE"] = yahoo_close
-
             has_ca = False
             try:
                 actions = self.india.fetch_yahoo_actions(ticker, "US", range_="1mo")
