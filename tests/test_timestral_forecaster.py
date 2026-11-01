@@ -31,6 +31,10 @@ class _StubConfig:
     def get(self, dotted: str, default=None):
         return self.values.get(dotted, default)
 
+    def e(self, dotted: str, default=None):
+        """Mirror the engine-section accessor on the production Config object."""
+        return self.get(f"engine.{dotted}", default)
+
 
 class _StubForecaster:
     """Records every forecast call; returns fixed non-crossing quantiles."""
@@ -166,10 +170,12 @@ def test_joint_multivariate_forward_pass_includes_macro_variates() -> None:
 
     assert len(stub.calls) == 1, "the cross-section must be one joint (B=1, V, T) pass"
     call = stub.calls[0]
-    assert call["context"].shape == (1, 6 + 2, 140)
-    assert call["past_covariates"].shape == (1, 6, 140)
+    # Targets contain one return and one abnormal-volume variate per name, then
+    # the two macro variates. Historical covariates add three per name plus macro.
+    assert call["context"].shape == (1, 2 * 6 + 2, 140)
+    assert call["past_covariates"].shape == (1, 3 * 6 + 2, 140)
     assert call["known_covariates"].shape == (1, 3, 140 + 5)
-    assert call["categorical_known_covariates"].shape == (1, 6, 140 + 5)
+    assert call["categorical_known_covariates"].shape == (1, 2 * 6, 140 + 5)
     assert "categorical_past_covariates" not in call
     assert engine.mode == "model"
     assert sorted(result.index) == sorted(groups)
@@ -202,7 +208,7 @@ def test_macro_free_call_synthesises_breadth_and_dispersion_variates() -> None:
 
     engine.forecast_universe_cross_section(groups, market="US")
 
-    assert stub.calls[0]["context"].shape[1] == 4 + 2, "V = stocks + breadth + dispersion"
+    assert stub.calls[0]["context"].shape[1] == 2 * 4 + 2, "V = returns + volume + breadth + dispersion"
 
 
 def test_liquidity_cap_truncates_the_variate_axis() -> None:
@@ -217,7 +223,7 @@ def test_liquidity_cap_truncates_the_variate_axis() -> None:
 
     result = engine.forecast_universe_cross_section(groups, market="INDIA")
 
-    assert stub.calls[0]["context"].shape[1] == 3 + 2
+    assert stub.calls[0]["context"].shape[1] == 2 * 3 + 2
     assert len(result) == 3
     assert set(result.index) == {"T3.NS", "T4.NS", "T5.NS"}, "highest-dollar-volume names survive"
 

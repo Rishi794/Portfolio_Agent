@@ -68,6 +68,11 @@ class FlexModelReplayRuntime:
                 arena.restore_state(saved["arena"])
             except (KeyError, TypeError, ValueError):
                 restored = False
+                # Restore validates several arrays in sequence and may have copied
+                # some of them before discovering a later mismatch. A fresh arena is
+                # required before replaying from the beginning, or history is applied
+                # on top of partially restored state.
+                arena = self.registry.allocate_arena(names, market)
         if restored:
             replay_prices = price_frame[pd.to_datetime(price_frame["date"]) > checkpoint]
             replay_actions = action_frame[pd.to_datetime(action_frame["ex_date"]) > checkpoint]

@@ -593,7 +593,10 @@ class V4AutonomousPortfolioReducer:
             )
             trend = zscore((1.0 - blend) * trend + blend * flex_trend - spread_penalty * flex_spread, 0.0)
 
-            flex_quality = zscore(flex_frame.get("f_fundamentals", pd.Series(0.0, index=universe_index)), 0.0)
+            flex_fundamentals_feature = f"f_fundamentals_{market.lower()}"
+            flex_quality = zscore(
+                flex_frame.get(flex_fundamentals_feature, pd.Series(0.0, index=universe_index)), 0.0
+            )
             quality = zscore((1.0 - blend) * quality + blend * flex_quality, 0.0)
             flex_tech = zscore(flex_frame.get("f_tech_patent_velocity", pd.Series(0.0, index=universe_index)), 0.0)
             tech_scores = zscore((1.0 - blend) * tech_scores + blend * flex_tech, 0.0)
