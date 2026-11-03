@@ -48,6 +48,7 @@ from .ingestion.nse_bse_bhavcopy_corporate_actions import adjust_for_actions
 from .ingestion.history_coverage import write_history_coverage_manifest
 from .state.ledger import Ledger
 from .storage.lakehouse import Lakehouse, manifest_row
+from .storage.price_integrity import repair_invalid_market_prices
 
 PILLARS = ("kalman_trend", "fundamentals", "tech_evolution", "gov_policy", "geopolitics", "macro_beta")
 
@@ -138,6 +139,9 @@ class V4AutonomousPortfolioReducer:
                     frame = frame.assign(market=market)
                 count = self.lake.write(route, frame, enforce_pit=route not in LATEST_WINS_TABLES)
                 written[route] = written.get(route, 0) + count
+        removed_prices = repair_invalid_market_prices(self.lake)
+        if removed_prices:
+            print(f"[price-integrity] removed {removed_prices} bars with missing or non-positive OHLC values")
         write_history_coverage_manifest(
             self.lake.read("market_prices"), self.state_dir / "historical_coverage.json"
         )

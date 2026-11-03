@@ -24,6 +24,7 @@ import pandas as pd
 from ..config import Config
 from ..filtering.embedding_projector import EventProjector, get_backend
 from ..filtering.self_calibrating_engine import SelfCalibratingQuantEngine
+from ..storage.price_integrity import clean_ohlc_rows
 from .base import HttpClient, write_shard
 from .fundamentals_edgar_indian_xbrl import (
     NSE_HEADERS,
@@ -210,6 +211,7 @@ class UnifiedCompanyShardWorker:
             return pd.DataFrame() if frame is None else frame
         out = frame.copy()
         out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+        out, _removed = clean_ohlc_rows(out)
         return (
             out.sort_values(["ticker", "date"])
             .drop_duplicates(["ticker", "date"], keep="last")

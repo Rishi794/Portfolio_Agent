@@ -2,13 +2,12 @@
 
 Two layers of checks:
 
-1. **Required tables** — the tables the Fan-In and the backtester actually consume
-   must exist and be non-empty once the pipeline has run at least once. The
-   spec-level names (``raw_ohlcv``, ``fundamentals_pit``, ``tech_evolution_pit``,
-   ``policy_geopol_events``, ``corporate_actions``) are mapped onto the physical
-   lakehouse files through aliases so the verifier doubles as the naming contract.
+1. **Core tables** — prices, fundamentals, corporate actions and technology
+   snapshots must exist and be non-empty. Policy/geopolitical events and macro
+   series are optional feeds; a missing/empty optional feed is reported but does
+   not fail a workflow that intentionally degrades to neutral factors.
 2. **Schema-driven integrity** — primary-key uniqueness, null knowledge timestamps,
-   embedding widths and non-positive OHLC values (a corrupt price panel silently
+   embedding widths and invalid OHLC values (a corrupt price panel silently
    destroys every downstream estimator, so it is a hard failure).
 
 Usage:
@@ -25,6 +24,7 @@ from pathlib import Path
 import pandas as pd
 
 from .lakehouse import Lakehouse
+from .price_integrity import valid_ohlc_mask
 
 # Spec-level table name -> physical lakehouse file stem.
 REQUIRED_TABLES: dict[str, str] = {
@@ -32,6 +32,9 @@ REQUIRED_TABLES: dict[str, str] = {
     "corporate_actions": "corporate_actions",
     "fundamentals_pit": "fundamentals_pit",
     "tech_evolution_pit": "tech_evolution_pit",
+}
+
+OPTIONAL_TABLES: dict[str, str] = {
     "policy_geopol_events": "policy_geopol_events",
     "macro_external_pit": "macro_external_pit",
 }
@@ -40,21 +43,25 @@ _PRICE_COLUMNS = ("open", "high", "low", "close")
 
 
 def verify_required_tables(lake: Lakehouse, *, require_non_empty: bool = True) -> dict[str, object]:
-    """Existence / non-emptiness / OHLC sanity for the spec-mandated tables."""
+    """Check core datasets and report optional feed availability without failing."""
     report: dict[str, object] = {}
     issues: list[str] = []
-    for spec_name, physical in REQUIRED_TABLES.items():
+    tables = [(name, physical, True) for name, physical in REQUIRED_TABLES.items()]
+    tables.extend((name, physical, False) for name, physical in OPTIONAL_TABLES.items())
+    for spec_name, physical, required in tables:
         entry: dict[str, object] = {"physical_table": physical}
         if not lake.exists(physical):
-            entry["status"] = "missing"
-            issues.append(f"required table {spec_name!r} missing ({physical}.parquet)")
+            entry["status"] = "missing" if required else "optional_missing"
+            if required:
+                issues.append(f"required table {spec_name!r} missing ({physical}.parquet)")
             report[spec_name] = entry
             continue
         frame = lake.read(physical)
         entry["rows"] = int(len(frame))
         if require_non_empty and frame.empty:
-            entry["status"] = "empty"
-            issues.append(f"required table {spec_name!r} is empty ({physical}.parquet)")
+            entry["status"] = "empty" if required else "optional_empty"
+            if required:
+                issues.append(f"required table {spec_name!r} is empty ({physical}.parquet)")
         else:
             entry["status"] = "ok"
         price_columns = [col for col in _PRICE_COLUMNS if col in frame.columns]
@@ -65,9 +72,23 @@ def verify_required_tables(lake: Lakehouse, *, require_non_empty: bool = True) -
                 bad = int((values <= 0).sum())
                 if bad:
                     non_positive[column] = bad
-            if non_positive:
+            invalid_mask = ~valid_ohlc_mask(frame)
+            invalid_count = int(invalid_mask.sum())
+            if non_positive or invalid_count:
                 entry["non_positive_prices"] = non_positive
-                issues.append(f"raw_ohlcv: non-positive OHLC values {non_positive}")
+                entry["invalid_ohlc_rows"] = invalid_count
+                sample_columns = [
+                    column for column in ("ticker", "date", *_PRICE_COLUMNS) if column in frame
+                ]
+                entry["invalid_ohlc_samples"] = json.loads(
+                    frame.loc[invalid_mask, sample_columns]
+                    .head(10)
+                    .to_json(orient="records", date_format="iso")
+                )
+                issues.append(
+                    f"raw_ohlcv: invalid OHLC rows={invalid_count}, non-positive values={non_positive}; "
+                    f"sample={entry['invalid_ohlc_samples']}"
+                )
         report[spec_name] = entry
     return {"ok": not issues, "tables": report, "issues": issues}
 

@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import Config
+from ..storage.price_integrity import clean_ohlc_rows
 from .base import HttpClient, SourceUnavailable, write_shard
 from .universe import knowledge_timestamp_for_close
 
@@ -82,7 +83,8 @@ class IndianBhavcopyAndCorporateActionIngestor:
         out["adj_close"] = out["close"]
         out["dollar_volume"] = out["close"] * out["volume"]
         out["knowledge_timestamp"] = knowledge_timestamp_for_close(day, market, self.config)
-        return out.dropna(subset=["close"]).reset_index(drop=True)
+        clean, _removed = clean_ohlc_rows(out)
+        return clean
 
     # ------------------------------------------------------ corporate actions ---
     def prime_nse_session(self) -> None:

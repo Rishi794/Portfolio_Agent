@@ -78,6 +78,14 @@ class Lakehouse:
         tmp.replace(self.path(name))
         return len(combined)
 
+    def replace(self, name: str, frame: pd.DataFrame) -> int:
+        """Atomically replace a table with a complete, already-resolved snapshot."""
+        outgoing = self._coerce(frame, self.spec(name))
+        tmp = self.path(name).with_suffix(".parquet.tmp")
+        outgoing.to_parquet(tmp, compression="zstd", index=False)
+        tmp.replace(self.path(name))
+        return len(outgoing)
+
     # ---------------------------------------------------------------- queries --
     def connect(self) -> duckdb.DuckDBPyConnection:
         con = duckdb.connect(database=":memory:")

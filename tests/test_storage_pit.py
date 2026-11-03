@@ -101,8 +101,10 @@ def test_embedding_width_is_validated(lake: Lakehouse) -> None:
 def test_required_table_report_detects_missing_and_bad_prices(lake: Lakehouse) -> None:
     report = verify_required_tables(lake)
     assert not report["ok"]
-    assert len(report["issues"]) == len(report["tables"])  # everything missing
+    assert len(report["issues"]) == 4  # the four core tables are missing
     assert report["tables"]["raw_ohlcv"]["physical_table"] == "market_prices"
+    assert report["tables"]["policy_geopol_events"]["status"] == "optional_missing"
+    assert report["tables"]["macro_external_pit"]["status"] == "optional_missing"
 
     frame = pd.DataFrame(
         [
@@ -115,6 +117,47 @@ def test_required_table_report_detects_missing_and_bad_prices(lake: Lakehouse) -
     report = verify_required_tables(lake, require_non_empty=False)
     assert "non-positive" in " ".join(report["issues"])
     assert report["tables"]["raw_ohlcv"]["non_positive_prices"] == {"close": 1}
+    assert report["tables"]["raw_ohlcv"]["invalid_ohlc_rows"] == 1
+
+
+def test_optional_macro_and_event_feeds_do_not_fail_core_integrity(lake: Lakehouse) -> None:
+    lake.write(
+        "market_prices",
+        pd.DataFrame(
+            [{
+                "ticker": "X", "market": "US", "date": "2026-01-05", "open": 1.0,
+                "high": 1.1, "low": 0.9, "close": 1.0, "volume": 10.0, "adj_close": 1.0,
+                "dollar_volume": 10.0, "knowledge_timestamp": pd.Timestamp("2026-01-05", tz="UTC"),
+            }]
+        ),
+    )
+    lake.write("fundamentals_pit", pd.DataFrame([_fundamental_row(-3.0, "2026-01-05")]))
+    lake.write(
+        "corporate_actions",
+        pd.DataFrame(
+            [{
+                "ticker": "X", "market": "US", "ex_date": "2026-01-05", "action_type": "DIVIDEND",
+                "split_ratio": 1.0, "cash_dividend": 0.1,
+                "knowledge_timestamp": pd.Timestamp("2026-01-04", tz="UTC"),
+            }]
+        ),
+    )
+    lake.write(
+        "tech_evolution_pit",
+        pd.DataFrame(
+            [{
+                "ticker": "X", "market": "US",
+                "knowledge_timestamp": pd.Timestamp("2026-01-05", tz="UTC"),
+                "citation_velocity_log_ratio": 0.1,
+            }]
+        ),
+    )
+
+    report = verify_required_tables(lake)
+
+    assert report["ok"]
+    assert report["tables"]["policy_geopol_events"]["status"] == "optional_missing"
+    assert report["tables"]["macro_external_pit"]["status"] == "optional_missing"
 
 
 def test_query_and_asof_join_work(lake: Lakehouse) -> None:

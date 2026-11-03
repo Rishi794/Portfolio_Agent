@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import Config
+from ..storage.price_integrity import clean_ohlc_rows
 from .base import HttpClient, SourceUnavailable, write_shard
 from .universe import knowledge_timestamp_for_close
 
@@ -67,7 +68,8 @@ class MarketDataIngestor:
                     "knowledge_timestamp": knowledge_timestamp_for_close(day, market, self.config),
                 }
             )
-        return pd.DataFrame(rows)
+        clean, _removed = clean_ohlc_rows(pd.DataFrame(rows))
+        return clean
 
     # ------------------------------------------------------------------ Stooq ---
     def fetch_stooq(self, symbol: str, market: str) -> pd.DataFrame:
@@ -85,7 +87,13 @@ class MarketDataIngestor:
         frame["price_source"] = "STOOQ"
         frame["adj_close"] = frame["close"]
         frame["knowledge_timestamp"] = [knowledge_timestamp_for_close(d, market, self.config) for d in frame["date"]]
-        return frame[["ticker", "market", "price_source", "date", "open", "high", "low", "close", "volume", "adj_close", "knowledge_timestamp"]]
+        columns = [
+            "ticker", "market", "price_source", "date", "open", "high", "low", "close",
+            "volume", "adj_close", "knowledge_timestamp",
+        ]
+        selected = frame[columns]
+        clean, _removed = clean_ohlc_rows(selected)
+        return clean
 
     # ------------------------------------------------------------------ India ---
     def fetch_nse_bhavcopy(self, day: dt.date, market: str = "INDIA") -> pd.DataFrame:
@@ -117,7 +125,8 @@ class MarketDataIngestor:
         )
         out["adj_close"] = out["close"]
         out["knowledge_timestamp"] = knowledge_timestamp_for_close(day, market, self.config)
-        return out.dropna(subset=["close"]).reset_index(drop=True)
+        clean, _removed = clean_ohlc_rows(out)
+        return clean
 
     # ------------------------------------------------------------------- main ---
     def ingest_us(self, symbols: list[str], range_: str = "2y") -> pd.DataFrame:
