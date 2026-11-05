@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-05T05:56:59.097808+00:00",
-  "run_id": "f3c774dc-20261105",
+  "generated_at": "2026-11-05T06:44:46.344562+00:00",
+  "run_id": "9938941b-20261105",
   "as_of": "2026-11-05",
   "mode": "weekly_deep_sync",
   "markets": {
@@ -87,5 +87,5 @@
       "adv_map": 0
     }
   },
-  "telemetry_sha256": "06a62bde649c851c6bf38dfd34d5659b5794b665a5da47b8a9b67b99c4044d1b"
+  "telemetry_sha256": "d9dce04467c6a48041232ab816dbc6d280491c861e25982fddece583e47143ec"
 }
