@@ -1,27 +1,16 @@
-"""Point-in-Time walk-forward backtester for US (NYSE/NASDAQ) and India (NSE/BSE).
+"""Point-in-time walk-forward evaluation using the shared V5 feature and allocation path.
 
-Leakage discipline
-------------------
-On every rebalancing session ``t`` the engine slices **only** data stamped at or
-before ``t``: prices/corporate actions up to ``t``, SEC/NSE filings with
-``filing_timestamp <= t``, macro vintages published by ``t``, and news/patents
-published by ``t``. The signal is then realized out-of-sample from ``t`` to
-``t + Δ`` — features never see their own outcome.
-
-Costs
------
-Corwin-Schultz high-low effective spread + statutory friction (Indian
-STT/stamp-duty/exchange/SEBI + GST; US SEC §31 + FINRA TAF) + the endogenous KKT
-no-trade band. A trade only happens if the drift exceeds the band.
-
-Outputs ``state/nav_history.jsonl`` rows (``portfolio_nav``, ``benchmark_nav``,
-``daily_return``) that the GitHub Pages dashboard plots directly.
+The historical module name is retained for existing commands. The backtest now calls
+the same reducer feature builder, Flex replay, Timestral forecaster, HRP allocator, and
+transaction-cost estimator as the live pipeline. Historical golden-copy quorum evidence
+is not available for the full OHLCV history, so the report states that limitation.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -29,353 +18,334 @@ import numpy as np
 import pandas as pd
 
 from ..config import Config
-from ..filtering.forensics import estimate_survival_gate, fundamental_quality_score, gate_mask
-from ..filtering.lowdin_orthogonalizer import lowdin_orthogonalize
-from ..filtering.self_calibrating_engine import SelfCalibratingQuantEngine
-from ..main_v4 import PILLARS, V4AutonomousPortfolioReducer
+from ..filtering.statistics import zscore
+from ..flex_model.aladdin_features import flex as aladdin_flex
+from ..flex_model.runtime import FlexModelReplayRuntime
+from ..main_v4 import V4AutonomousPortfolioReducer
 
 
 class WalkForwardBacktesterV4:
+    """Walk-forward strategy replay over the V5 reducer's point-in-time features."""
+
     def __init__(self, config: Config, lake_dir: str | Path, state_dir: str | Path) -> None:
         self.config = config
         self.lake_dir = Path(lake_dir)
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.quant = SelfCalibratingQuantEngine(config)
         self.reducer = V4AutonomousPortfolioReducer(config, self.lake_dir, self.state_dir)
+        # Feature generation may estimate US→India spillover, but a backtest must not
+        # mutate the production lakehouse while replaying historical dates.
+        self.reducer.persist_derived_features = False
+        self._flex_temp = tempfile.TemporaryDirectory(prefix="pms-walk-forward-flex-")
+        if bool(config.get("aladdin.flex_model.enabled", True)):
+            self.reducer.flex_runtime = FlexModelReplayRuntime(self._flex_temp.name, aladdin_flex)
 
-    # ------------------------------------------------------------------ helpers --
-    def _fundamentals_history(self, market: str) -> pd.DataFrame:
-        frame = self.reducer.lake.read("fundamentals_pit")
-        if frame.empty:
-            return frame
-        frame = frame[frame["market"].astype(str) == market].copy()
-        frame["filing_timestamp"] = pd.to_datetime(frame["filing_timestamp"], utc=True, errors="coerce")
-        return frame.sort_values("filing_timestamp")
+    @staticmethod
+    def _write_json_atomic(path: Path, value: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        rendered = json.dumps(value, indent=2, default=str, allow_nan=False) + "\n"
+        temporary.write_text(rendered, encoding="utf-8")
+        temporary.replace(path)
 
-    def _tech_history(self, market: str) -> pd.DataFrame:
-        frame = self.reducer.lake.read("tech_evolution_pit")
-        if frame.empty:
-            return frame
-        frame = frame[frame["market"].astype(str) == market].copy()
-        frame["knowledge_timestamp"] = pd.to_datetime(frame["knowledge_timestamp"], utc=True, errors="coerce")
-        return frame.sort_values("knowledge_timestamp")
+    def _replace_market_nav(self, market: str, records: list[dict[str, Any]]) -> None:
+        """Replace this market's latest backtest curve without touching live NAV."""
+        path = self.state_dir / "walk_forward_nav_history.jsonl"
+        existing: list[dict[str, Any]] = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and str(row.get("market")) != market:
+                    existing.append(row)
+        combined = existing + records
+        combined.sort(key=lambda row: (str(row.get("market", "")), str(row.get("date", ""))))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            "".join(json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n" for row in combined),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
 
-    def _events(self) -> pd.DataFrame:
-        events = self.reducer.lake.read("policy_geopol_events")
-        if events.empty:
-            return events
-        events = events.copy()
-        events["published_timestamp"] = pd.to_datetime(events["published_timestamp"], utc=True, errors="coerce")
-        return events.dropna(subset=["published_timestamp"]).sort_values("published_timestamp")
-
-    def _snapshot_before(self, frame: pd.DataFrame, column: str, stamp: pd.Timestamp) -> pd.DataFrame:
-        if frame.empty:
-            return frame
-        return frame[frame[column] <= stamp]
-
-    # ------------------------------------------------------------------- signals --
-    def _event_pillar(
+    def run_walk_forward(
         self,
         market: str,
-        stamp: pd.Timestamp,
-        events: pd.DataFrame,
-        fundamentals_hist: pd.DataFrame,
-        universe: list[str],
-        domain_key: str,
-    ) -> pd.Series:
-        if events.empty or "embedding" not in events.columns:
-            return pd.Series(0.0, index=universe, dtype=float)
-        domains = (self.config.e("events.market_domains", {}) or {}).get(market, {}).get(domain_key, [])
-        subset = events[
-            events["domain"].astype(str).isin([str(domain) for domain in domains])
-            & (events["published_timestamp"] <= stamp)
-        ]
-        if subset.empty:
-            return pd.Series(0.0, index=universe, dtype=float)
-        # company vectors known at `stamp` (first 10-K available at that time)
-        known = self._snapshot_before(fundamentals_hist, "filing_timestamp", stamp)
-        if known.empty:
-            return pd.Series(0.0, index=universe, dtype=float)
-        known = known.drop_duplicates(subset=["ticker"], keep="last").set_index("ticker")
-        vectors: dict[str, np.ndarray] = {}
-        for ticker in universe:
-            if ticker not in known.index:
-                continue
-            embedding = known.loc[ticker, "business_embedding"] if "business_embedding" in known.columns else None
-            if embedding is None or (isinstance(embedding, float) and np.isnan(embedding)):
-                continue
-            vector = np.asarray(embedding, dtype=np.float32)
-            if vector.size == 0:
-                continue
-            vectors[ticker] = vector / max(float(np.linalg.norm(vector)), 1e-12)
-        if not vectors:
-            return pd.Series(0.0, index=universe, dtype=float)
-        from ..filtering.embedding_projector import EventProjector, get_backend
+        rebalance_step_days: int = 5,
+        warmup: int = 60,
+    ) -> dict[str, Any]:
+        if rebalance_step_days < 1:
+            return {"market": market, "error": "rebalance_step_days must be positive"}
+        if warmup < 1:
+            return {"market": market, "error": "warmup must be positive"}
 
-        projector = EventProjector(self.config, backend=get_backend("hashing"))
-        result = projector.project_to_tickers(
-            pd.DataFrame(vectors).T,
-            subset,
-            as_of=stamp.to_pydatetime(),
-        )
-        return result.scores.reindex(universe).fillna(0.0)
-
-    # --------------------------------------------------------------------- engine --
-    def run_walk_forward(self, market: str, rebalance_step_days: int = 5, warmup: int = 60) -> dict[str, Any]:
-        ohlcv_df, _ = self.reducer.query_pit_split_adjusted_universe(market)
-        if ohlcv_df.empty:
+        # Start each market from the same full available history, even when this
+        # object already replayed another market and left its reducer as-of in the past.
+        self.reducer.as_of = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+        prices, _ = self.reducer.query_pit_split_adjusted_universe(market)
+        if prices.empty:
             return {"market": market, "error": "No historical OHLCV data in the lakehouse"}
 
-        lookback_days = int(self.config.e("optimizer.cov_lookback_days", 160))
-        prices = ohlcv_df.copy()
-        prices["trade_date"] = pd.to_datetime(prices["trade_date"])
-        all_dates = sorted(prices["trade_date"].unique())
+        prices = prices.copy()
+        prices["trade_date"] = pd.to_datetime(prices["trade_date"], errors="coerce")
+        if isinstance(prices["trade_date"].dtype, pd.DatetimeTZDtype):
+            prices["trade_date"] = prices["trade_date"].dt.tz_localize(None)
+        prices = prices.dropna(subset=["trade_date"])
+        all_dates = sorted(pd.Timestamp(value).normalize() for value in prices["trade_date"].unique())
         if len(all_dates) < warmup + 20:
-            return {"market": market, "error": f"Need >= {warmup + 20} trading days; found {len(all_dates)}"}
+            return {
+                "market": market,
+                "error": f"Need at least {warmup + 20} trading sessions; found {len(all_dates)}",
+            }
 
-        close = prices.pivot_table(index="trade_date", columns="ticker", values="adj_close", aggfunc="last").sort_index()
-        high = prices.pivot_table(index="trade_date", columns="ticker", values="adj_high", aggfunc="last").sort_index()
-        low = prices.pivot_table(index="trade_date", columns="ticker", values="adj_low", aggfunc="last").sort_index()
-        volume = prices.pivot_table(index="trade_date", columns="ticker", values="volume", aggfunc="last").sort_index()
+        close = prices.pivot_table(
+            index="trade_date", columns="ticker", values="adj_close", aggfunc="last"
+        ).sort_index()
         returns = close.pct_change(fill_method=None)
-
-        macro_matrix = self.reducer.regime_detector.build_macro_matrix(self.reducer.macro_pit())
-        fundamentals_hist = self._fundamentals_history(market)
-        tech_hist = self._tech_history(market)
-        events = self._events()
-
+        lookback_days = int(self.config.e("optimizer.cov_lookback_days", 160))
+        canonical_pillars = list(self.reducer.pillar_names())
         current_weights = pd.Series(0.0, index=close.columns, dtype=float)
+        starting_cash = float(self.reducer.starting_cash.get(market, 100_000.0))
+        if not np.isfinite(starting_cash) or starting_cash <= 0.0:
+            return {"market": market, "error": "starting cash must be positive and finite"}
+
         portfolio_nav = 1.0
         benchmark_nav = 1.0
         nav_records: list[dict[str, Any]] = []
         ortho_snapshots: list[pd.DataFrame] = []
         forward_snapshots: list[pd.Series] = []
         total_turnover = 0.0
-        total_fees = 0.0
+        total_fee_value = 0.0
+        feature_modes: dict[str, set[str]] = {"timestral": set(), "flex": set()}
+        min_ic_observations = int(self.config.e("factor_learning.min_ic_observations", 5))
 
         for idx in range(warmup, len(all_dates) - 1):
-            stamp = pd.Timestamp(all_dates[idx], tz="UTC")
+            stamp = all_dates[idx]
             next_date = all_dates[idx + 1]
+            step_fee = 0.0
 
             if (idx - warmup) % rebalance_step_days == 0:
-                history = close.iloc[: idx + 1]
-                hist_returns = returns.iloc[: idx + 1]
-                universe = list(close.columns)
-
-                # 1. Kalman trend (Myers-Tapley, learned Q/R)
-                trend = self.quant.kalman_trend_scores(history, min_observations=20)
-
-                # 2. PIT fundamentals: forensic gate + quality score
-                known = self._snapshot_before(fundamentals_hist, "filing_timestamp", stamp)
-                if not known.empty:
-                    known = known.drop_duplicates(subset=["ticker"], keep="last").set_index("ticker")
-                    known["dollar_volume_20d"] = pd.to_numeric(known.get("dollar_volume_20d"), errors="coerce")
-                    known["gics_sector"] = known.get("gics_sector", pd.Series("UNKNOWN", index=known.index)).fillna("UNKNOWN")
-                    thresholds = estimate_survival_gate(known, self.config)
-                    mask = gate_mask(
-                        known,
-                        thresholds,
-                        min_dollar_volume=float(self.config.e("forensics.min_dollar_volume", 15_000_000.0)),
-                    )
-                    quality = fundamental_quality_score(
-                        known,
-                        tuple(self.config.e("forensics.quality_weights", [0.45, 0.35, 0.20])),
-                        winsor_quantile=float(self.config.e("forensics.winsor_quantile", 0.01)),
-                    )
-                else:
-                    mask = pd.Series(True, index=universe)
-                    quality = pd.Series(0.0, index=universe)
-
-                # 3. Technology evolution (patents / productive R&D)
-                tech_known = self._snapshot_before(tech_hist, "knowledge_timestamp", stamp)
-                if not tech_known.empty:
-                    tech_known = tech_known.drop_duplicates(subset=["ticker"], keep="last").set_index("ticker")
-                    tech_scores = self.reducer.factor_tech_evolution(market, tech_known, pd.Index(universe))
-                else:
-                    tech_scores = pd.Series(0.0, index=universe, dtype=float)
-
-                # 4./5. Policy & geopolitics via the PIT event projector
-                policy = self._event_pillar(market, stamp, events, fundamentals_hist, universe, "gov_policy")
-                geopol = self._event_pillar(market, stamp, events, fundamentals_hist, universe, "geopolitics")
-
-                # 6. Macro / external beta (+ US->India spillover inside the reducer)
-                # macro_matrix carries a tz-naive index (observation dates); `stamp`
-                # is tz-aware UTC, so compare like with like.
-                macro_asof = stamp.tz_localize(None) if macro_matrix.index.tz is None else stamp
-                macro_shocks = macro_matrix[macro_matrix.index <= macro_asof]
-                macro_beta = self.reducer.factor_macro_beta(
-                    market, hist_returns.tail(lookback_days), macro_shocks
+                self.reducer.as_of = stamp
+                # Feedback is date-dependent. Clear the reducer cache so every
+                # simulated rebalance sees only labels that have matured by this date.
+                self.reducer.feedback_cache.pop(market, None)
+                macro_matrix = self.reducer.regime_detector.build_macro_matrix(self.reducer.macro_pit())
+                regime = self.reducer.regime_detector.detect(macro_matrix)
+                factors, feature_diagnostics = self.reducer.build_factor_matrix(
+                    market, regime, macro_matrix
                 )
-
-                def _z(series: pd.Series) -> pd.Series:
-                    from ..filtering.statistics import zscore as _zscore
-
-                    return _zscore(series.reindex(universe).fillna(0.0), 0.0)
-
-                raw_factors = pd.DataFrame(
-                    {
-                        "kalman_trend": _z(trend) if not trend.empty else 0.0,
-                        "fundamentals": _z(quality),
-                        "tech_evolution": _z(tech_scores),
-                        "gov_policy": _z(policy),
-                        "geopolitics": _z(geopol),
-                        "macro_beta": _z(macro_beta),
-                    }
-                )
-                eligible = mask.reindex(universe).fillna(True).astype(bool)
-                raw_factors = raw_factors[list(PILLARS)]
-
-                if raw_factors.sum().abs().sum() <= 0.0 or int(eligible.sum()) < 5:
-                    # No signal at all: stay in cash for this leg rather than pretend.
-                    ortho = pd.DataFrame()
-                    alpha = pd.Series(dtype=float)
-                    weights = np.zeros(len(PILLARS))
+                timestral = (feature_diagnostics.get("timestral") or {}).get("mode")
+                if timestral:
+                    feature_modes["timestral"].add(str(timestral))
+                flex = feature_diagnostics.get("flex_model") or {}
+                if flex:
+                    feature_modes["flex"].add("enabled")
                 else:
-                    ortho = lowdin_orthogonalize(
-                        raw_factors.loc[eligible],
-                        winsor_quantile=float(self.config.e("lowdin.winsor_quantile", 0.02)),
-                        eigenvalue_floor=float(self.config.e("lowdin.eigenvalue_floor", 1e-4)),
-                        min_observations=int(self.config.e("lowdin.min_observations", 8)),
-                    )
-                    if len(ortho_snapshots) >= int(self.config.e("factor_learning.min_ic_observations", 5)):
-                        learned = self.quant.learn_rolling_ic_ir_factor_weights(
+                    feature_modes["flex"].add("disabled")
+
+                eligible = (
+                    factors["eligible"].reindex(close.columns).fillna(False).astype(bool)
+                    if not factors.empty and "eligible" in factors.columns
+                    else pd.Series(False, index=close.columns)
+                )
+                raw_factors = (
+                    factors.reindex(close.columns)
+                    .reindex(columns=canonical_pillars, fill_value=0.0)
+                    .apply(pd.to_numeric, errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .fillna(0.0)
+                )
+                ortho = pd.DataFrame()
+                alpha = pd.Series(dtype=float)
+                if int(eligible.sum()) >= 5 and float(raw_factors.loc[eligible].abs().to_numpy().sum()) > 0.0:
+                    ortho = self.reducer.lowdin_orthogonalize_matrix(raw_factors.loc[eligible])
+                    prior = self.reducer._pillar_prior(regime, canonical_pillars)
+                    if len(ortho_snapshots) >= min_ic_observations:
+                        learned = self.reducer.engine.learn_rolling_ic_ir_factor_weights(
                             ortho_snapshots[-40:], forward_snapshots[-40:]
                         )
-                        weights = self.quant.blend_with_prior(
+                        weights = self.reducer.engine.blend_with_prior(
                             np.asarray(learned["weights"], dtype=float),
-                            np.ones(len(PILLARS)) / len(PILLARS),
+                            prior,
                             int(learned.get("observations", 0)),
                         )
                     else:
-                        weights = np.ones(len(PILLARS)) / len(PILLARS)
-                    alpha = pd.Series(ortho.to_numpy(dtype=float) @ weights, index=ortho.index, dtype=float)
-                    alpha = _z(alpha)
+                        weights = prior
+                    alpha = pd.Series(
+                        ortho.to_numpy(dtype=float) @ weights,
+                        index=ortho.index,
+                        dtype=float,
+                    )
+                    alpha = zscore(alpha, 0.0)
 
-                # store snapshot for the IC learning (forward return realized below)
+                # The label for this snapshot ends no later than the next scheduled
+                # rebalance, so it cannot affect the signal that generated the label.
                 fwd_end = min(idx + rebalance_step_days, len(all_dates) - 1)
-                realized_forward = (close.iloc[fwd_end] / close.iloc[idx] - 1.0).reindex(ortho.index if not ortho.empty else [])
                 if not ortho.empty:
+                    realized = close.iloc[fwd_end].div(close.iloc[idx]).sub(1.0).reindex(ortho.index)
                     ortho_snapshots.append(ortho)
-                    forward_snapshots.append(realized_forward.fillna(0.0))
+                    forward_snapshots.append(realized.replace([np.inf, -np.inf], np.nan).fillna(0.0))
 
-                if alpha.empty:
-                    target = pd.Series(dtype=float)
+                hist_returns = returns.iloc[: idx + 1].tail(lookback_days)
+                prices_asof = (
+                    factors["price"].reindex(close.columns)
+                    if not factors.empty and "price" in factors.columns
+                    else pd.Series(dtype=float)
+                )
+                sectors = (
+                    factors["gics_sector"].reindex(close.columns).fillna("UNKNOWN")
+                    if not factors.empty and "gics_sector" in factors.columns
+                    else pd.Series("UNKNOWN", index=close.columns, dtype="object")
+                )
+                if not alpha.empty:
+                    alpha, _shrunk = self.reducer.apply_matured_stock_reliability(market, alpha)
+                    equity = portfolio_nav * starting_cash
+                    target, tickets, _allocation_diagnostics = self.reducer.allocate(
+                        market,
+                        alpha,
+                        hist_returns,
+                        prices_asof,
+                        regime.cash_buffer,
+                        current_weights.to_dict(),
+                        sectors,
+                        equity,
+                    )
                 else:
-                    top = alpha[alpha > 0].sort_values(ascending=False).head(30).index.tolist()
-                    market_returns_hist = hist_returns.mean(axis=1)
-                    market_vol = float(market_returns_hist.tail(60).std() * np.sqrt(252))
-                    market_sharpe = (
-                        float(market_returns_hist.tail(60).mean() * 252 / max(market_vol, 1e-9))
-                        if market_vol > 0
-                        else 0.0
-                    )
-                    cash_buffer = float(
-                        np.clip(
-                            market_vol / 0.45,
-                            float(self.config.e("turbulence.cash_min", 0.03)),
-                            float(self.config.e("turbulence.cash_max", 0.45)),
-                        )
-                    )
-                    if top:
-                        target = self.reducer.allocate_true_ward_hrp(
-                            hist_returns[top].tail(lookback_days).dropna(how="all").fillna(0.0),
-                            alpha.loc[top],
-                            cash_buffer,
-                        )
-                    else:
-                        target = pd.Series(dtype=float)
+                    target = pd.Series(dtype=float)
+                    tickets = []
 
-                # cost-aware rebalancing: only trade outside the stock-specific deadband
+                # Execute only orders the shared live allocator would emit (deadband,
+                # minimum notional, statutory friction, half spread, impact, turnover).
+                # Historical golden-copy quorum data does not cover the full OHLCV
+                # history, so the V5 pre-trade verification gate is reported separately.
                 rebalanced = current_weights.copy()
-                step_cost = 0.0
-                for ticker in rebalanced.index:
-                    current_w = float(current_weights.get(ticker, 0.0))
-                    target_w = float(target.get(ticker, 0.0)) if not target.empty else 0.0
-                    drift = target_w - current_w
-                    if abs(drift) < 1e-6:
+                equity = max(portfolio_nav * starting_cash, 1e-12)
+                step_turnover = 0.0
+                fee_value = 0.0
+                for order in tickets:
+                    ticker = str(order.get("ticker", ""))
+                    side = 1.0 if str(order.get("action", "")).upper() == "BUY" else -1.0
+                    notional = float(order.get("order_value") or 0.0)
+                    cost_bps = max(float(order.get("est_cost_bps") or 0.0), 0.0)
+                    if not ticker or not np.isfinite(notional) or notional <= 0.0:
                         continue
-                    window_slice = slice(max(0, idx - 60), idx + 1)
-                    cost_fraction, deadband = self.quant.estimate_corwin_schultz_spread_and_deadband(
-                        high=high[ticker].iloc[window_slice].to_numpy(dtype=float),
-                        low=low[ticker].iloc[window_slice].to_numpy(dtype=float),
-                        close=close[ticker].iloc[window_slice].to_numpy(dtype=float),
-                        volume=volume[ticker].iloc[window_slice].to_numpy(dtype=float),
-                        market=market,
-                        market_sharpe=market_sharpe if "market_sharpe" in locals() else 0.0,
-                        market_vol=market_vol if "market_vol" in locals() else 0.2,
+                    executed_weight = notional / equity
+                    rebalanced.loc[ticker] = max(
+                        float(rebalanced.get(ticker, 0.0)) + side * executed_weight,
+                        0.0,
                     )
-                    if abs(drift) >= deadband or (target_w <= 1e-9 and current_w > 0):
-                        rebalanced[ticker] = target_w
-                        step_cost += abs(drift) * cost_fraction
-                        total_turnover += abs(drift)
-                step_fee = step_cost
-                total_fees += step_fee
+                    step_turnover += executed_weight
+                    fee_value += notional * cost_bps / 10_000.0
+                step_fee = min(max(fee_value / equity, 0.0), 0.99)
+                total_turnover += step_turnover
+                total_fee_value += fee_value
+                if step_fee > 0.0:
+                    rebalanced = rebalanced / (1.0 - step_fee)
                 current_weights = rebalanced
                 portfolio_nav *= 1.0 - step_fee
 
-            day_return = returns.iloc[idx + 1]
-            port_day_return = float((current_weights * day_return.reindex(current_weights.index).fillna(0.0)).sum())
-            bench_day_return = float(day_return.mean()) if day_return.notna().any() else 0.0
-            portfolio_nav *= 1.0 + port_day_return
-            benchmark_nav *= 1.0 + bench_day_return
+            day_return = returns.iloc[idx + 1].reindex(current_weights.index).fillna(0.0)
+            gross_port_return = float((current_weights * day_return).sum())
+            gross_port_return = max(gross_port_return, -0.999999)
+            benchmark_return = (
+                float(returns.iloc[idx + 1].mean())
+                if returns.iloc[idx + 1].notna().any()
+                else 0.0
+            )
+            nav_before_day = portfolio_nav
+            portfolio_nav *= 1.0 + gross_port_return
+            benchmark_nav *= 1.0 + benchmark_return
+            net_port_return = portfolio_nav / max(nav_before_day / max(1.0 - step_fee, 1e-12), 1e-12) - 1.0
+            # Drift holdings by realized returns; this is necessary for the next
+            # rebalance's turnover and fees to reflect the actual post-return book.
+            if 1.0 + gross_port_return > 1e-12:
+                current_weights = current_weights.mul(1.0 + day_return).div(1.0 + gross_port_return)
             nav_records.append(
                 {
                     "date": pd.Timestamp(next_date).strftime("%Y-%m-%d"),
                     "market": market,
-                    "portfolio_nav": round(portfolio_nav, 6),
-                    "benchmark_nav": round(benchmark_nav, 6),
-                    "daily_return": round(port_day_return, 6),
-                    "invested_weight": round(float(current_weights.sum()), 4),
+                    "strategy": "v5_shared_reducer_signals",
+                    "portfolio_nav": round(portfolio_nav, 8),
+                    "benchmark_nav": round(benchmark_nav, 8),
+                    "daily_return": round(net_port_return, 8),
+                    "gross_daily_return": round(gross_port_return, 8),
+                    "transaction_cost_pct": round(step_fee * 100.0, 8),
+                    "invested_weight": round(float(current_weights.sum()), 6),
                 }
             )
 
         if not nav_records:
-            return {"market": market, "error": "no sessions simulated"}
+            return {"market": market, "error": "No sessions simulated"}
 
+        self._replace_market_nav(market, nav_records)
         frame = pd.DataFrame(nav_records)
-        rets = frame["daily_return"].to_numpy(dtype=float)
-        ann_return = float(np.mean(rets) * 252)
-        ann_vol = float(np.std(rets) * np.sqrt(252)) + 1e-12
-        downside = float(np.std(np.minimum(0.0, rets)) * np.sqrt(252)) + 1e-12
-        nav = frame["portfolio_nav"].to_numpy(dtype=float)
-        running_max = np.maximum.accumulate(nav)
-        drawdowns = (nav - running_max) / np.maximum(running_max, 1e-12)
-
-        with (self.state_dir / "nav_history.jsonl").open("a", encoding="utf-8") as handle:
-            for record in nav_records:
-                handle.write(json.dumps(record) + "\n")
-
-        return {
+        net_returns = frame["daily_return"].to_numpy(dtype=float)
+        annual_vol = float(np.std(net_returns, ddof=0) * np.sqrt(252.0))
+        downside_deviation = float(np.sqrt(np.mean(np.minimum(net_returns, 0.0) ** 2) * 252.0))
+        annual_arithmetic_return = float(np.mean(net_returns) * 252.0)
+        elapsed_days = max((pd.Timestamp(all_dates[-1]) - pd.Timestamp(all_dates[warmup])).days, 1)
+        cagr = float(portfolio_nav ** (365.25 / elapsed_days) - 1.0)
+        benchmark_cagr = float(benchmark_nav ** (365.25 / elapsed_days) - 1.0)
+        nav = np.concatenate(([1.0], frame["portfolio_nav"].to_numpy(dtype=float)))
+        drawdowns = (nav - np.maximum.accumulate(nav)) / np.maximum.accumulate(nav)
+        summary = {
             "market": market,
+            "strategy": "v5_shared_reducer_signals",
+            "signal_path": "V5 reducer factor builder (Flex replay + Timestral when enabled)",
+            "execution_model": (
+                "shared live HRP allocator and estimated transaction costs; "
+                "historical golden-copy gate unavailable"
+            ),
             "sessions_tested": int(len(frame)),
-            "final_portfolio_nav": round(portfolio_nav, 4),
-            "final_benchmark_nav": round(benchmark_nav, 4),
-            "cagr_pct": round(ann_return * 100, 2),
-            "annual_vol_pct": round(ann_vol * 100, 2),
-            "sharpe_ratio": round(ann_return / ann_vol, 3),
-            "sortino_ratio": round(ann_return / downside, 3),
-            "max_drawdown_pct": round(float(np.min(drawdowns)) * 100, 2),
+            "first_test_date": pd.Timestamp(all_dates[warmup]).strftime("%Y-%m-%d"),
+            "last_test_date": pd.Timestamp(all_dates[-1]).strftime("%Y-%m-%d"),
+            "final_portfolio_nav": round(portfolio_nav, 6),
+            "final_benchmark_nav": round(benchmark_nav, 6),
+            "total_return_pct": round((portfolio_nav - 1.0) * 100.0, 2),
+            "benchmark_total_return_pct": round((benchmark_nav - 1.0) * 100.0, 2),
+            "cagr_pct": round(cagr * 100.0, 2),
+            "benchmark_cagr_pct": round(benchmark_cagr * 100.0, 2),
+            "annual_vol_pct": round(annual_vol * 100.0, 2),
+            "sharpe_ratio": round(annual_arithmetic_return / max(annual_vol, 1e-12), 3),
+            "sortino_ratio": round(annual_arithmetic_return / max(downside_deviation, 1e-12), 3),
+            "max_drawdown_pct": round(float(np.min(drawdowns)) * 100.0, 2),
             "total_turnover_x": round(total_turnover, 3),
-            "total_fees_pct_of_nav": round(total_fees * 100, 4),
+            "total_fees_pct_of_initial_nav": round(total_fee_value / starting_cash * 100.0, 4),
+            "feature_modes": {key: sorted(value) for key, value in feature_modes.items()},
         }
+        self._write_json_atomic(self.state_dir / f"walk_forward_summary_{market.lower()}.json", summary)
+        return summary
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="V4 PIT walk-forward backtester")
+    parser = argparse.ArgumentParser(description="V5 point-in-time walk-forward backtester")
     parser.add_argument("--lake-dir", type=Path, required=True)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--market", default="BOTH", choices=["INDIA", "US", "BOTH"])
     parser.add_argument("--rebalance-step-days", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=60)
     args = parser.parse_args(argv)
 
     config = Config.load()
     backtester = WalkForwardBacktesterV4(config, args.lake_dir, args.state_dir)
     markets = ["INDIA", "US"] if args.market == "BOTH" else [args.market]
-    for market in markets:
-        summary = backtester.run_walk_forward(market, rebalance_step_days=args.rebalance_step_days)
-        print(json.dumps(summary, indent=2))
-    return 0
+    summaries = {
+        market: backtester.run_walk_forward(
+            market,
+            rebalance_step_days=args.rebalance_step_days,
+            warmup=args.warmup,
+        )
+        for market in markets
+    }
+    report = {
+        "strategy": "v5_shared_reducer_signals",
+        "markets": summaries,
+    }
+    backtester._write_json_atomic(backtester.state_dir / "walk_forward_summary.json", report)
+    print(json.dumps(report, indent=2, allow_nan=False))
+    return 1 if any("error" in value for value in summaries.values()) else 0
 
 
 if __name__ == "__main__":

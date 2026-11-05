@@ -2,7 +2,8 @@
 
 Reads the portfolio state directory written by the reducer and the approval
 reconciler — ``portfolio_ledger_<market>.json``, ``pending_orders_*.json``,
-``ledger_events.jsonl``, ``nav_history.jsonl`` and ``risk_attribution.json`` —
+``ledger_events.jsonl``, ``nav_history.jsonl``, ``walk_forward_nav_history.jsonl``
+and ``risk_attribution.json`` —
 and emits one self-contained HTML file. No build step, no server, no cost.
 
 Panels: dual-market books (equity / cash / σp / CVaR99 / state hash badge),
@@ -80,6 +81,10 @@ def _book_summary(
     for row in nav_rows:
         if str(row.get("market") or market) != market:
             continue
+        # Older backtest versions wrote unit-normalized portfolio NAV into the
+        # live ledger file. Keep that research series out of account equity charts.
+        if "portfolio_nav" in row and "equity" not in row:
+            continue
         nav.append(
             {
                 "date": str(row.get("date") or row.get("as_of") or row.get("ts") or ""),
@@ -105,6 +110,15 @@ def build_payload(state_dir: Path) -> dict[str, Any]:
     risk_doc = _load_json(state_dir / "risk_attribution.json", {})
     risk_markets = risk_doc.get("markets", {}) if isinstance(risk_doc, dict) else {}
     nav_rows = _load_jsonl(state_dir / "nav_history.jsonl", limit=1200)
+    walk_forward_rows = _load_jsonl(state_dir / "walk_forward_nav_history.jsonl", limit=5000)
+    walk_forward = {
+        market: [
+            row
+            for row in walk_forward_rows
+            if str(row.get("market")) == market
+        ]
+        for market in ("US", "INDIA")
+    }
 
     ledger_us = _load_json(state_dir / "portfolio_ledger_us.json", {"cash": 100_000.0, "positions": {}})
     ledger_in = _load_json(state_dir / "portfolio_ledger_india.json", {"cash": 1_000_000.0, "positions": {}})
@@ -126,6 +140,7 @@ def build_payload(state_dir: Path) -> dict[str, Any]:
         "run_mode": "live" if has_state else "synthetic_demo",
         "telemetry_sha256": risk_doc.get("telemetry_sha256") if isinstance(risk_doc, dict) else None,
         "books": books,
+        "walk_forward": walk_forward,
         "pending": pending,
         "events": events,
         "risk": risk_markets,
@@ -213,6 +228,17 @@ TEMPLATE = """<!DOCTYPE html>
 
 <div class="grid-2">
   <div class="card">
+    <h2>🧪 US V5 Walk-Forward (net of modeled costs)</h2>
+    <div id="backtest-us" style="height:250px;"></div>
+  </div>
+  <div class="card">
+    <h2>🧪 India V5 Walk-Forward (net of modeled costs)</h2>
+    <div id="backtest-india" style="height:250px;"></div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
     <h2>⏳ Pre-Trade Compliance — Approved Orders (awaiting '/approve')</h2>
     <table><thead><tr><th>Market</th><th>Action</th><th>Ticker</th><th>Shares</th><th>Ref Px</th><th>Target Wt</th><th>Deadband</th><th>α z</th><th>Note</th></tr></thead>
       <tbody id="tbl-pending"></tbody></table>
@@ -276,7 +302,7 @@ function renderBook(prefix, book) {
     {x: nav.map(r => r.date), y: nav.map(r => r.cash), name: 'Cash', type: 'scatter', mode: 'lines',
      line: {color: '#64748b', width: 1.3, dash: 'dot'}}
   ] : [];
-  Plotly.newPlot('nav-' + prefix, navTraces, layout('Walk-Forward Equity & Cash'),
+  Plotly.newPlot('nav-' + prefix, navTraces, layout('Live Ledger Equity & Cash'),
                  {responsive: true, displayModeBar: false});
 
   const euler = (risk.euler_risk_table || []).slice(0, 9);
@@ -312,9 +338,23 @@ function renderBook(prefix, book) {
       </tr>`).join('');
 }
 
+function renderWalkForward(market, elementId) {
+  const rows = (DATA.walk_forward || {})[market] || [];
+  const traces = rows.length ? [
+    {x: rows.map(r => r.date), y: rows.map(r => r.portfolio_nav), name: 'V5 portfolio (net)',
+     type: 'scatter', mode: 'lines', line: {color: '#10b981', width: 2.2}},
+    {x: rows.map(r => r.date), y: rows.map(r => r.benchmark_nav), name: 'Equal-weight benchmark',
+     type: 'scatter', mode: 'lines', line: {color: '#f59e0b', width: 1.7}}
+  ] : [];
+  Plotly.newPlot(elementId, traces, layout(rows.length ? 'Normalized NAV (start = 1)' : 'No walk-forward run yet'),
+                 {responsive: true, displayModeBar: false});
+}
+
 const EMPTY_BOOK = {positions: [], nav: [], cash: 0, equity: 0, cash_pct: 100, currency: 'USD', risk: {}};
 renderBook('us', DATA.books.find(b => b.market === 'US') || EMPTY_BOOK);
 renderBook('india', DATA.books.find(b => b.market === 'INDIA') || EMPTY_BOOK);
+renderWalkForward('US', 'backtest-us');
+renderWalkForward('INDIA', 'backtest-india');
 
 const pending = DATA.pending || [];
 document.getElementById('tbl-pending').innerHTML = pending.length === 0

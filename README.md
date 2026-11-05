@@ -229,8 +229,18 @@ uv run python -m src.backtest.walk_forward_v4 \
   --lake-dir data_lake --state-dir state --market BOTH
 ```
 
-PIT-sliced rebalancing, Corwin–Schultz + statutory costs, KKT deadbands, and
-CAGR/vol/Sharpe/Sortino/max-DD/turnover metrics written to `nav_history.jsonl`.
+The compatibility command runs the V5 reducer's point-in-time factor builder, Flex
+event replay, Timestral forecaster when available, shared HRP allocator, deadbands, and
+transaction-cost estimator. The strategy NAV is written separately to
+`walk_forward_nav_history.jsonl`, so it cannot be mixed with live ledger equity in
+`nav_history.jsonl`. A machine-readable summary is saved as `walk_forward_summary.json`.
+
+The weekly deep-ingestion workflow runs this validation after lakehouse integrity
+checks. Historical golden-copy quorum data is not available across the entire OHLCV
+history, so the backtest reports that its pre-trade verification gate was not replayed;
+its returns are research estimates, not a guarantee of live performance. The weekly
+workflow starts Sundays at 16:23 UTC (21:53 IST), off the top of the hour and with a
+buffer before Monday's India EOD schedule; its walk-forward job has a 4-hour step limit.
 
 ---
 

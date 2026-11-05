@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from src.reporting.investment_summary_generator import InvestmentSummaryGenerator
+from src.reporting.dashboard_builder import build_payload
 
 
 def test_investment_summary_uses_portfolio_state_and_current_run_proposals(tmp_path):
@@ -78,3 +79,36 @@ def test_investment_summary_uses_portfolio_state_and_current_run_proposals(tmp_p
     assert "No automatic ticker quarantine" in rendered
     assert "descriptive, not causal" in rendered
     assert "not a formal coverage guarantee" in rendered
+
+
+def test_dashboard_keeps_backtest_nav_out_of_live_ledger_and_shows_separate_curve(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "nav_history.jsonl").write_text(
+        '\n'.join(
+            [
+                json.dumps({"date": "2026-10-01", "market": "US", "equity": 101000, "cash": 20000}),
+                json.dumps({"date": "2026-10-01", "market": "US", "portfolio_nav": 1.02, "benchmark_nav": 1.01}),
+            ]
+        ) + "\n",
+        encoding="utf-8",
+    )
+    (state_dir / "walk_forward_nav_history.jsonl").write_text(
+        json.dumps(
+            {
+                "date": "2026-10-01",
+                "market": "US",
+                "portfolio_nav": 1.02,
+                "benchmark_nav": 1.01,
+                "daily_return": 0.01,
+            }
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = build_payload(state_dir)
+    us_book = next(book for book in payload["books"] if book["market"] == "US")
+    assert len(us_book["nav"]) == 1
+    assert us_book["nav"][0]["equity"] == 101000
+    assert payload["walk_forward"]["US"][0]["portfolio_nav"] == 1.02
+    assert payload["walk_forward"]["INDIA"] == []

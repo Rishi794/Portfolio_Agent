@@ -113,6 +113,7 @@ class V4AutonomousPortfolioReducer:
         # ``market -> ticker-indexed Timestral frame`` for the V5 forward-CVaR fusion.
         self.timestral_frames: dict[str, pd.DataFrame] = {}
         self.flex_spillover_scores: dict[str, pd.Series] = {}
+        self.persist_derived_features = True
         self.run_id = f"{uuid.uuid4().hex[:8]}-{self.as_of:%Y%m%d}"
         self.calibration_rows: list[dict[str, Any]] = []
         self.feedback_cache: dict[str, dict[str, Any]] = {}
@@ -336,7 +337,7 @@ class V4AutonomousPortfolioReducer:
                 "sample_size": int(diagnostics.get("observations", 0)),
             }
         )
-        if not projected.empty:
+        if not projected.empty and self.persist_derived_features:
             stored = projected.rename("projected_beta_return").reset_index()
             stored.columns = ["ticker", "projected_beta_return"]
             stored["as_of_date"] = self.as_of

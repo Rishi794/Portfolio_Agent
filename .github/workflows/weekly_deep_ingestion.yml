@@ -1,5 +1,5 @@
 # =============================================================================
-# PMS V4 — weekly deep sync.
+# PMS V5 — weekly deep sync and walk-forward research.
 #
 #   • full SEC EDGAR companyfacts (all XBRL periods) + 10-K Item 1 business text
 #   • India NSE/BSE Ind-AS results + Regulation 31 promoter pledge / FII-DII
@@ -7,14 +7,16 @@
 #   • walk-forward validation on the refreshened Point-in-Time lakehouse
 #   • dashboard + Pages redeploy
 #
-# Runs Sunday 22:00 UTC. Targets validate/refresh the slow-moving pillars that the
-# daily fast path intentionally skips.
+# Runs Sunday 16:23 UTC (21:53 IST), leaving a buffer before Monday's India EOD run.
+# Targets validate/refresh the slow-moving pillars that the daily fast path skips. A
+# follow-up job runs V5 walk-forward research after the lakehouse is verified/published.
 # =============================================================================
-name: PMS V4 — Weekly Deep Ingestion
+name: PMS V5 — Weekly Deep Ingestion & Walk-Forward
 
 on:
   schedule:
-    - cron: "0 22 * * 0"          # Sunday 22:00 UTC (Monday 03:30 IST)
+    # Avoid the top of the hour, when GitHub documents elevated schedule delays.
+    - cron: "23 16 * * 0"         # Sunday 16:23 UTC (21:53 IST)
   workflow_dispatch:
 
 concurrency:
@@ -133,9 +135,9 @@ jobs:
 
   validate-and-publish:
     needs: [deep-company-shards, deep-tech-shards]
-    if: always() && needs.deep-company-shards.result != 'cancelled'
+    if: needs.deep-company-shards.result == 'success' && needs.deep-tech-shards.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
         with:
@@ -194,15 +196,7 @@ jobs:
             --dashboard-html ../pages_dist/index.html \
             --backend onnx
 
-      - name: Point-in-Time walk-forward validation (both markets)
-        working-directory: repo
-        run: |
-          uv run python -m src.backtest.walk_forward_v4 \
-            --lake-dir ../data_lake \
-            --state-dir ../state_branch \
-            --market BOTH | tee ../backtest_summary.json
-
-      - name: Verify Parquet integrity
+      - name: Verify Parquet integrity before research replay
         working-directory: repo
         run: uv run python -m src.storage.verify_parquet --data-dir ../data_lake
 
@@ -228,17 +222,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TITLE="🧪 V4 Weekly Deep Sync & Walk-Forward — $(date -u +%Y-%m-%d)"
+          TITLE="🧪 V5 Weekly Deep Sync — $(date -u +%Y-%m-%d)"
           {
             echo "## Trade ticket (weekly deep sync)"
             echo
             cat issue_body.md
             echo
-            echo "## Walk-forward (net of Corwin-Schultz spread + statutory fees + KKT deadbands)"
-            echo
-            echo '```json'
-            cat backtest_summary.json
-            echo '```'
           } > weekly_report.md
           gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
             --label automation --body-file weekly_report.md || true
@@ -258,7 +247,135 @@ jobs:
 
       - uses: actions/upload-pages-artifact@v5
         with:
+          name: github-pages-live
           path: pages_dist
 
       - id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-live
+
+  walk-forward:
+    needs: validate-and-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+      issues: write
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: repo
+
+      - uses: actions/checkout@v7
+        with:
+          ref: data-state
+          path: state_branch
+          fetch-depth: 0
+
+      - name: Download the lakehouse published by the weekly sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download v-data-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern lake.tar.gz \
+            --dir /tmp
+          mkdir -p data_lake
+          tar -xzf /tmp/lake.tar.gz -C data_lake
+
+      - name: Restore cached Timestral and embedding model files
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/onnx_models
+            ~/.cache/huggingface
+          key: pms-stage3-models-bge-timestral-5m-v1
+          restore-keys: pms-stage3-models-
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: repo/uv.lock
+
+      - name: Install V5 research dependencies
+        working-directory: repo
+        run: uv sync --all-extras
+
+      - name: Verify published Parquet before backtesting
+        working-directory: repo
+        run: uv run python -m src.storage.verify_parquet --data-dir ../data_lake
+
+      - name: V5 point-in-time walk-forward (US + India)
+        timeout-minutes: 240
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          uv run python -m src.backtest.walk_forward_v4 \
+            --lake-dir ../data_lake \
+            --state-dir ../state_branch \
+            --market BOTH \
+            --rebalance-step-days 5 \
+            --warmup 60 | tee ../backtest_summary.json
+
+      - name: Archive walk-forward report and curves
+        uses: actions/upload-artifact@v7
+        with:
+          name: walk-forward-${{ github.run_id }}
+          path: |
+            backtest_summary.json
+            state_branch/walk_forward_summary.json
+            state_branch/walk_forward_nav_history.jsonl
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Rebuild dashboard with the new backtest curves
+        working-directory: repo
+        run: |
+          uv run python -m src.reporting.dashboard_builder \
+            --state-dir ../state_branch \
+            --output-html ../pages_dist/index.html
+
+      - name: Commit backtest state
+        run: |
+          set -euo pipefail
+          cd state_branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add walk_forward_summary.json walk_forward_summary_us.json \
+            walk_forward_summary_india.json walk_forward_nav_history.jsonl
+          git diff --staged --quiet || git commit -m "chore(backtest): weekly V5 walk-forward $(date -u +%Y-%m-%d)"
+          git push origin HEAD:data-state
+
+      - name: Publish walk-forward results
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="🧪 V5 Walk-Forward Results — $(date -u +%Y-%m-%d)"
+          {
+            echo "## Point-in-time backtest results (net of modeled transaction costs)"
+            echo
+            echo '```json'
+            cat backtest_summary.json
+            echo '```'
+            echo
+            echo "Execution note: full historical Golden Copy quorum evidence is unavailable, so the live pre-trade verification gate is not represented in this research replay."
+          } > walk_forward_report.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+            --label automation --body-file walk_forward_report.md || true
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          name: github-pages-walk-forward
+          path: pages_dist
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-walk-forward
