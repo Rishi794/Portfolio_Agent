@@ -438,7 +438,7 @@ jobs:
             --lake-dir ../data_lake \
             --state-dir ../state_branch \
             --market "$BACKTEST_MARKET" \
-            --rebalance-step-days 5 \
+            --rebalance-step-days 1 \
             --warmup 60 \
             --test-sessions 252 \
             --profile daily | tee ../daily_backtest_summary.json

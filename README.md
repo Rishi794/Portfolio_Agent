@@ -244,7 +244,7 @@ buffer before Monday's India EOD schedule; its walk-forward job has a 4-hour ste
 
 The weekday EOD workflow also runs a rolling daily backtest after the final open
 market closes: after the US close when the US has a session, otherwise after India's
-close. It tests the latest 252 trading sessions and rebalances every five sessions.
+close. It tests the latest 252 trading sessions and rebalances every session.
 Daily results are saved as `walk_forward_nav_daily.jsonl` and
 `walk_forward_summary_daily*.json`; the weekly full-history curve remains in
 `walk_forward_nav_history.jsonl`. The dashboard displays the latest daily curve when
