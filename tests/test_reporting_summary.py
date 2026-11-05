@@ -112,3 +112,17 @@ def test_dashboard_keeps_backtest_nav_out_of_live_ledger_and_shows_separate_curv
     assert us_book["nav"][0]["equity"] == 101000
     assert payload["walk_forward"]["US"][0]["portfolio_nav"] == 1.02
     assert payload["walk_forward"]["INDIA"] == []
+    assert payload["walk_forward_profile"] == "full"
+
+
+def test_dashboard_prefers_daily_backtest_curve_when_available(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    full_row = {"date": "2026-10-01", "market": "US", "portfolio_nav": 1.02}
+    daily_row = {"date": "2026-11-04", "market": "US", "profile": "daily", "portfolio_nav": 1.03}
+    (state_dir / "walk_forward_nav_history.jsonl").write_text(json.dumps(full_row) + "\n", encoding="utf-8")
+    (state_dir / "walk_forward_nav_daily.jsonl").write_text(json.dumps(daily_row) + "\n", encoding="utf-8")
+
+    payload = build_payload(state_dir)
+    assert payload["walk_forward_profile"] == "daily"
+    assert payload["walk_forward"]["US"] == [daily_row]

@@ -242,6 +242,15 @@ its returns are research estimates, not a guarantee of live performance. The wee
 workflow starts Sundays at 16:23 UTC (21:53 IST), off the top of the hour and with a
 buffer before Monday's India EOD schedule; its walk-forward job has a 4-hour step limit.
 
+The weekday EOD workflow also runs a rolling daily backtest after the final open
+market closes: after the US close when the US has a session, otherwise after India's
+close. It tests the latest 252 trading sessions and rebalances every five sessions.
+Daily results are saved as `walk_forward_nav_daily.jsonl` and
+`walk_forward_summary_daily*.json`; the weekly full-history curve remains in
+`walk_forward_nav_history.jsonl`. The dashboard displays the latest daily curve when
+one is available. GitHub cron scheduling can be delayed, so this is a post-close
+scheduled run rather than a guaranteed exact-time execution.
+
 ---
 
 ## 5. Repository layout

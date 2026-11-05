@@ -48,9 +48,25 @@ class WalkForwardBacktesterV4:
         temporary.write_text(rendered, encoding="utf-8")
         temporary.replace(path)
 
-    def _replace_market_nav(self, market: str, records: list[dict[str, Any]]) -> None:
-        """Replace this market's latest backtest curve without touching live NAV."""
-        path = self.state_dir / "walk_forward_nav_history.jsonl"
+    @staticmethod
+    def _profile_suffix(profile: str) -> str:
+        return "" if profile == "full" else f"_{profile}"
+
+    @classmethod
+    def _nav_filename(cls, profile: str) -> str:
+        if profile == "full":
+            return "walk_forward_nav_history.jsonl"
+        return f"walk_forward_nav{cls._profile_suffix(profile)}.jsonl"
+
+    def _replace_market_nav(
+        self,
+        market: str,
+        records: list[dict[str, Any]],
+        *,
+        profile: str,
+    ) -> None:
+        """Replace this profile/market curve without touching live or other NAV."""
+        path = self.state_dir / self._nav_filename(profile)
         existing: list[dict[str, Any]] = []
         if path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -75,11 +91,17 @@ class WalkForwardBacktesterV4:
         market: str,
         rebalance_step_days: int = 5,
         warmup: int = 60,
+        test_sessions: int | None = None,
+        profile: str = "full",
     ) -> dict[str, Any]:
         if rebalance_step_days < 1:
             return {"market": market, "error": "rebalance_step_days must be positive"}
         if warmup < 1:
             return {"market": market, "error": "warmup must be positive"}
+        if profile not in {"full", "daily"}:
+            return {"market": market, "error": "profile must be 'full' or 'daily'"}
+        if test_sessions is not None and test_sessions < 1:
+            return {"market": market, "error": "test_sessions must be positive"}
 
         # Start each market from the same full available history, even when this
         # object already replayed another market and left its reducer as-of in the past.
@@ -99,6 +121,7 @@ class WalkForwardBacktesterV4:
                 "market": market,
                 "error": f"Need at least {warmup + 20} trading sessions; found {len(all_dates)}",
             }
+        test_start_idx = max(warmup, len(all_dates) - test_sessions - 1) if test_sessions else warmup
 
         close = prices.pivot_table(
             index="trade_date", columns="ticker", values="adj_close", aggfunc="last"
@@ -121,12 +144,14 @@ class WalkForwardBacktesterV4:
         feature_modes: dict[str, set[str]] = {"timestral": set(), "flex": set()}
         min_ic_observations = int(self.config.e("factor_learning.min_ic_observations", 5))
 
-        for idx in range(warmup, len(all_dates) - 1):
+        for idx in range(test_start_idx, len(all_dates) - 1):
             stamp = all_dates[idx]
             next_date = all_dates[idx + 1]
             step_fee = 0.0
 
-            if (idx - warmup) % rebalance_step_days == 0:
+            # Rebalance on the first test session, then maintain the requested
+            # cadence. A rolling daily window can start on any calendar index.
+            if (idx - test_start_idx) % rebalance_step_days == 0:
                 self.reducer.as_of = stamp
                 # Feedback is date-dependent. Clear the reducer cache so every
                 # simulated rebalance sees only labels that have matured by this date.
@@ -266,6 +291,7 @@ class WalkForwardBacktesterV4:
                 {
                     "date": pd.Timestamp(next_date).strftime("%Y-%m-%d"),
                     "market": market,
+                    "profile": profile,
                     "strategy": "v5_shared_reducer_signals",
                     "portfolio_nav": round(portfolio_nav, 8),
                     "benchmark_nav": round(benchmark_nav, 8),
@@ -279,19 +305,22 @@ class WalkForwardBacktesterV4:
         if not nav_records:
             return {"market": market, "error": "No sessions simulated"}
 
-        self._replace_market_nav(market, nav_records)
+        self._replace_market_nav(market, nav_records, profile=profile)
         frame = pd.DataFrame(nav_records)
         net_returns = frame["daily_return"].to_numpy(dtype=float)
         annual_vol = float(np.std(net_returns, ddof=0) * np.sqrt(252.0))
         downside_deviation = float(np.sqrt(np.mean(np.minimum(net_returns, 0.0) ** 2) * 252.0))
         annual_arithmetic_return = float(np.mean(net_returns) * 252.0)
-        elapsed_days = max((pd.Timestamp(all_dates[-1]) - pd.Timestamp(all_dates[warmup])).days, 1)
+        first_test_date = pd.Timestamp(nav_records[0]["date"])
+        last_test_date = pd.Timestamp(nav_records[-1]["date"])
+        elapsed_days = max((last_test_date - first_test_date).days, 1)
         cagr = float(portfolio_nav ** (365.25 / elapsed_days) - 1.0)
         benchmark_cagr = float(benchmark_nav ** (365.25 / elapsed_days) - 1.0)
         nav = np.concatenate(([1.0], frame["portfolio_nav"].to_numpy(dtype=float)))
         drawdowns = (nav - np.maximum.accumulate(nav)) / np.maximum.accumulate(nav)
         summary = {
             "market": market,
+            "profile": profile,
             "strategy": "v5_shared_reducer_signals",
             "signal_path": "V5 reducer factor builder (Flex replay + Timestral when enabled)",
             "execution_model": (
@@ -299,8 +328,9 @@ class WalkForwardBacktesterV4:
                 "historical golden-copy gate unavailable"
             ),
             "sessions_tested": int(len(frame)),
-            "first_test_date": pd.Timestamp(all_dates[warmup]).strftime("%Y-%m-%d"),
-            "last_test_date": pd.Timestamp(all_dates[-1]).strftime("%Y-%m-%d"),
+            "test_sessions_requested": test_sessions,
+            "first_test_date": first_test_date.strftime("%Y-%m-%d"),
+            "last_test_date": last_test_date.strftime("%Y-%m-%d"),
             "final_portfolio_nav": round(portfolio_nav, 6),
             "final_benchmark_nav": round(benchmark_nav, 6),
             "total_return_pct": round((portfolio_nav - 1.0) * 100.0, 2),
@@ -315,7 +345,11 @@ class WalkForwardBacktesterV4:
             "total_fees_pct_of_initial_nav": round(total_fee_value / starting_cash * 100.0, 4),
             "feature_modes": {key: sorted(value) for key, value in feature_modes.items()},
         }
-        self._write_json_atomic(self.state_dir / f"walk_forward_summary_{market.lower()}.json", summary)
+        suffix = self._profile_suffix(profile)
+        self._write_json_atomic(
+            self.state_dir / f"walk_forward_summary{suffix}_{market.lower()}.json",
+            summary,
+        )
         return summary
 
 
@@ -326,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--market", default="BOTH", choices=["INDIA", "US", "BOTH"])
     parser.add_argument("--rebalance-step-days", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=60)
+    parser.add_argument("--test-sessions", type=int, default=None)
+    parser.add_argument("--profile", choices=["daily", "full"], default="full")
     args = parser.parse_args(argv)
 
     config = Config.load()
@@ -336,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
             market,
             rebalance_step_days=args.rebalance_step_days,
             warmup=args.warmup,
+            test_sessions=args.test_sessions,
+            profile=args.profile,
         )
         for market in markets
     }
@@ -343,7 +381,11 @@ def main(argv: list[str] | None = None) -> int:
         "strategy": "v5_shared_reducer_signals",
         "markets": summaries,
     }
-    backtester._write_json_atomic(backtester.state_dir / "walk_forward_summary.json", report)
+    suffix = backtester._profile_suffix(args.profile)
+    backtester._write_json_atomic(
+        backtester.state_dir / f"walk_forward_summary{suffix}.json",
+        report,
+    )
     print(json.dumps(report, indent=2, allow_nan=False))
     return 1 if any("error" in value for value in summaries.values()) else 0
 

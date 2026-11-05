@@ -110,7 +110,14 @@ def build_payload(state_dir: Path) -> dict[str, Any]:
     risk_doc = _load_json(state_dir / "risk_attribution.json", {})
     risk_markets = risk_doc.get("markets", {}) if isinstance(risk_doc, dict) else {}
     nav_rows = _load_jsonl(state_dir / "nav_history.jsonl", limit=1200)
-    walk_forward_rows = _load_jsonl(state_dir / "walk_forward_nav_history.jsonl", limit=5000)
+    daily_walk_forward_path = state_dir / "walk_forward_nav_daily.jsonl"
+    walk_forward_profile = "daily" if daily_walk_forward_path.exists() else "full"
+    walk_forward_path = (
+        daily_walk_forward_path
+        if walk_forward_profile == "daily"
+        else state_dir / "walk_forward_nav_history.jsonl"
+    )
+    walk_forward_rows = _load_jsonl(walk_forward_path, limit=5000)
     walk_forward = {
         market: [
             row
@@ -141,6 +148,7 @@ def build_payload(state_dir: Path) -> dict[str, Any]:
         "telemetry_sha256": risk_doc.get("telemetry_sha256") if isinstance(risk_doc, dict) else None,
         "books": books,
         "walk_forward": walk_forward,
+        "walk_forward_profile": walk_forward_profile,
         "pending": pending,
         "events": events,
         "risk": risk_markets,

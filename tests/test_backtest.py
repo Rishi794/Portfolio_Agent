@@ -80,3 +80,34 @@ def test_backtest_nav_replaces_same_market_curve_without_duplicates(
     ]
     assert len(rows) == second["sessions_tested"]
     assert len({(row["market"], row["date"]) for row in rows}) == len(rows)
+
+
+def test_daily_profile_caps_window_and_keeps_full_curve_separate(
+    e2e: dict, config, tmp_path: Path
+) -> None:
+    state_dir = tmp_path / "bt_state_daily"
+    backtester = WalkForwardBacktesterV4(config, e2e["lake_dir"], state_dir)
+    full = backtester.run_walk_forward("US", rebalance_step_days=10, warmup=60)
+    daily = backtester.run_walk_forward(
+        "US", rebalance_step_days=5, warmup=60, test_sessions=30, profile="daily"
+    )
+
+    assert "error" not in full, full.get("error")
+    assert "error" not in daily, daily.get("error")
+    assert daily["profile"] == "daily"
+    assert daily["test_sessions_requested"] == 30
+    assert daily["sessions_tested"] == 30
+    daily_rows = [
+        json.loads(line)
+        for line in (state_dir / "walk_forward_nav_daily.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    full_rows = [
+        json.loads(line)
+        for line in (state_dir / "walk_forward_nav_history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(daily_rows) == 30
+    assert len(full_rows) == full["sessions_tested"]
+    assert daily_rows[0]["profile"] == "daily"
+    assert daily_rows[0]["date"] == daily["first_test_date"]

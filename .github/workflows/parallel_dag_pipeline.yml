@@ -3,7 +3,7 @@
 #
 #   prepare ─┬─ company-shards  (US ×5 shards, INDIA ×5 shards: OHLCV + actions + fundamentals)
 #            ├─ domain-shards   (macro PIT, Federal Register, PIB/RBI/SEBI, GDELT, patents)
-#            └─ fan-in          (merge shards → regime → Löwdin → HRP → ticket → Pages)
+#            └─ fan-in          (merge → V5 ticket → publish → daily rolling backtest → Pages)
 #
 # Cost profile: free GitHub-hosted runners only. Heavy network work is sharded so the
 # wall-clock stays small and the weekly deep sync (separate workflow) carries the long
@@ -57,6 +57,7 @@ jobs:
       markets: ${{ steps.gate.outputs.markets }}
       market_matrix: ${{ steps.gate.outputs.market_matrix }}
       run_pipeline: ${{ steps.gate.outputs.run }}
+      us_session_today: ${{ steps.gate.outputs.us_session_today }}
       run_label: ${{ steps.decide.outputs.run_label }}
     steps:
       - uses: actions/checkout@v7
@@ -280,7 +281,7 @@ jobs:
       needs.company-shards.result != 'cancelled' &&
       needs.domain-shards.result != 'cancelled'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
         with:
@@ -406,6 +407,69 @@ jobs:
             || gh release create v-data-latest --repo "$GITHUB_REPOSITORY" --title "Rolling lakehouse" \
                  --notes "Rotating Point-in-Time Parquet lakehouse (data_lake/*.parquet)"
           gh release upload v-data-latest lake.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Run once after the last open market closes. On ordinary weekdays this is
+      # the US pass and includes both markets; on US holidays the India pass runs
+      # an India-only backtest. Manual runs honor the requested target market.
+      - name: Daily rolling V5 backtest (last 252 trading sessions)
+        id: daily_backtest
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          contains(needs.prepare.outputs.markets, 'US') ||
+          (contains(needs.prepare.outputs.markets, 'INDIA') && needs.prepare.outputs.us_session_today != 'true')
+        timeout-minutes: 180
+        working-directory: repo
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_XET: "1"
+          TARGET_MARKET: ${{ github.event.inputs.target_market || 'BOTH' }}
+          SCHEDULED_MARKETS: ${{ needs.prepare.outputs.markets }}
+          US_SESSION_TODAY: ${{ needs.prepare.outputs.us_session_today }}
+        run: |
+          set -euo pipefail
+          BACKTEST_MARKET="BOTH"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            BACKTEST_MARKET="$TARGET_MARKET"
+          elif [ "$SCHEDULED_MARKETS" = "INDIA" ] && [ "$US_SESSION_TODAY" != "true" ]; then
+            BACKTEST_MARKET="INDIA"
+          fi
+          echo "market=$BACKTEST_MARKET" >> "$GITHUB_OUTPUT"
+          uv run python -m src.backtest.walk_forward_v4 \
+            --lake-dir ../data_lake \
+            --state-dir ../state_branch \
+            --market "$BACKTEST_MARKET" \
+            --rebalance-step-days 5 \
+            --warmup 60 \
+            --test-sessions 252 \
+            --profile daily | tee ../daily_backtest_summary.json
+
+      - name: Rebuild dashboard with daily backtest curve
+        if: steps.daily_backtest.outcome == 'success'
+        working-directory: repo
+        run: |
+          uv run python -m src.reporting.dashboard_builder \
+            --state-dir ../state_branch \
+            --output-html ../pages_dist/index.html
+
+      - name: Commit daily backtest state
+        if: steps.daily_backtest.outcome == 'success'
+        run: |
+          set -euo pipefail
+          cd state_branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add walk_forward_summary_daily.json walk_forward_summary_daily_*.json walk_forward_nav_daily.jsonl
+          git diff --staged --quiet || git commit -m "chore(backtest): daily rolling V5 $(date -u +%Y-%m-%d)"
+          git push origin HEAD:data-state
+
+      - name: Preserve daily backtest report
+        if: steps.daily_backtest.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: daily-backtest-${{ needs.prepare.outputs.run_label }}
+          path: daily_backtest_summary.json
+          retention-days: 30
+          if-no-files-found: error
 
       - uses: actions/upload-pages-artifact@v5
         with:

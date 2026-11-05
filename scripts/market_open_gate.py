@@ -90,6 +90,17 @@ def market_is_open_now(market: str, now: dt.datetime) -> bool:
     return MIN_AFTER_CLOSE <= (now - close) <= MAX_AFTER_CLOSE
 
 
+def market_has_session_today(market: str, day: dt.date) -> bool:
+    """Return whether the exchange has a session on this local/UTC calendar day."""
+    calendar = _calendar(market)
+    session_day = pd.Timestamp(day)
+    try:
+        return bool(calendar.is_session(session_day))
+    except DateOutOfBounds:
+        # Preserve the existing weekday fallback once a pinned holiday table ends.
+        return day.weekday() < 5
+
+
 def main() -> int:
     now = dt.datetime.now(dt.timezone.utc)
     event = os.getenv("GITHUB_EVENT_NAME", "")
@@ -110,6 +121,7 @@ def main() -> int:
     _emit("market_matrix", json.dumps(open_markets or candidates))
     _emit("markets", ",".join(open_markets))
     _emit("run", "true" if open_markets else "false")
+    _emit("us_session_today", "true" if market_has_session_today("US", now.date()) else "false")
     return 0
 
 
