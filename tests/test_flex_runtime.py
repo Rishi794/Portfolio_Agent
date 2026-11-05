@@ -8,6 +8,7 @@ import pandas as pd
 
 from src.flex_model.aladdin_features import flex
 from src.flex_model.runtime import FlexModelReplayRuntime
+from src.main_v4 import V4AutonomousPortfolioReducer
 
 
 def _inputs(*, include_latest_bar: bool = False):
@@ -130,3 +131,27 @@ def test_partial_snapshot_restore_failure_rebuilds_from_clean_arena(tmp_path) ->
     actual, diagnostics = runtime.replay(**args)
     assert diagnostics["restored"] is False
     pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_reducer_blends_persisted_flex_replay_into_live_factors(e2e, tmp_path) -> None:
+    reducer: V4AutonomousPortfolioReducer = e2e["reducer"]
+    reducer.persist_derived_features = False
+    macro_matrix = reducer.regime_detector.build_macro_matrix(reducer.macro_pit())
+    regime = reducer.regime_detector.detect(macro_matrix)
+    batch_factors, _ = reducer.build_factor_matrix("US", regime, macro_matrix)
+
+    state_dir = tmp_path / "live-flex-state"
+    reducer.flex_runtime = FlexModelReplayRuntime(state_dir, flex)
+    replay_factors, diagnostics = reducer.build_factor_matrix("US", regime, macro_matrix)
+
+    assert diagnostics["flex_model"]["events"] > 0
+    assert diagnostics["flex_model"]["state_file"] == "flex_arena_us.json"
+    assert (state_dir / "flex_arena_us.json").is_file()
+    assert any(
+        not np.allclose(batch_factors[column], replay_factors[column], atol=1e-12)
+        for column in ("kalman_trend", "fundamentals", "tech_evolution", "gov_policy", "macro_beta")
+    )
+
+    restored_factors, restored_diagnostics = reducer.build_factor_matrix("US", regime, macro_matrix)
+    assert restored_diagnostics["flex_model"]["restored"] is True
+    pd.testing.assert_frame_equal(replay_factors, restored_factors)
