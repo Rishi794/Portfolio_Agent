@@ -1,14 +1,14 @@
 {
-  "generated_at": "2026-11-08T20:58:39.307661+00:00",
-  "run_id": "24ee2992-20261108",
-  "as_of": "2026-11-08",
+  "generated_at": "2026-11-15T21:39:44.486619+00:00",
+  "run_id": "708939c9-20261115",
+  "as_of": "2026-11-15",
   "mode": "weekly_deep_sync",
   "markets": {
     "US": {
       "market": "US",
-      "as_of": "2026-11-08",
+      "as_of": "2026-11-15",
       "regime": "LOW_VOL_EXPANSION",
-      "universe_size": 399,
+      "universe_size": 476,
       "eligible_size": 0,
       "port_ann_vol_pct": 0.0,
       "daily_student_t_cvar99_pct": 0.0,
@@ -33,11 +33,11 @@
       "compliance_scaled_orders": [],
       "ibor_identity_ok": true,
       "ibor_discrepancy": "0E-8",
-      "ledger_state_sha256": "cb5982b7c1a2d03d22ff14a00c53d6aac0928ee16b8a18ad85dcc13bd429dc93"
+      "ledger_state_sha256": "0686fd2c3fb906c8c1cb7ee6eccc96ecf9e26f831018c573220534729556858e"
     },
     "INDIA": {
       "market": "INDIA",
-      "as_of": "2026-11-08",
+      "as_of": "2026-11-15",
       "regime": "LOW_VOL_EXPANSION",
       "universe_size": 496,
       "eligible_size": 0,
@@ -64,7 +64,7 @@
       "compliance_scaled_orders": [],
       "ibor_identity_ok": true,
       "ibor_discrepancy": "0E-8",
-      "ledger_state_sha256": "153a27d082f8bf40a41700a35aac54ca5f42fe4b45e98cb6c075ae8482763807"
+      "ledger_state_sha256": "3e0a589397dee67bf014c26a2b0389df57edd18204a7d5ef489a8a8e7e5d5bce"
     }
   },
   "compliance_gate": {
@@ -87,5 +87,5 @@
       "adv_map": 0
     }
   },
-  "telemetry_sha256": "638f4ee693aeea5b8e8e2aa685f814cc2f4fa194c60bd1bf738e3d1b57a77df7"
+  "telemetry_sha256": "07676257d9a93dc216f12c9b1607454432faeb3a3653fd910f4d91a11b9dcd5e"
 }
